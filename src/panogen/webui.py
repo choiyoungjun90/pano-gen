@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from panogen.config import Config
 
+MIN_FREE_GB = float(os.environ.get("PANOGEN_MIN_FREE_GB", 3))   # 이보다 디스크가 적으면 작업 중단
 TQDM = re.compile(r"(\d+)/(\d+) \[([\d:]+)<([\d:?]+)")
 IMG_IDX = re.compile(r"\((\d+)/(\d+)\)")
 TILE = re.compile(r"타일 (\d+)/(\d+)")
@@ -55,6 +56,21 @@ class Job:
         self.proc = subprocess.Popen(cmd, cwd=root, env=env, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, bufsize=0)
         threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._disk_guard, args=(root,), daemon=True).start()
+
+    def _disk_guard(self, root: Path):
+        """디스크 여유가 MIN_FREE_GB 아래로 떨어지면 중단. 맥은 메모리가 모자라면 스왑이 디스크를 채워
+        (20B 모델 1장에 30GB 이상) 0 이 되면 시스템이 멈출 수 있음."""
+        import shutil
+
+        while self.state == "running":
+            free = shutil.disk_usage(root).free / 1024**3
+            if free < MIN_FREE_GB:
+                self.lines.append(f"디스크 여유 {free:.1f}GB — {MIN_FREE_GB}GB 미만이라 작업을 중단했습니다 (스왑이 디스크를 채우는 중)")
+                self.cancel()
+                self.reason = "disk"
+                return
+            time.sleep(5)
 
     def _read(self):
         buf = b""
@@ -120,7 +136,7 @@ class Job:
             self.proc.terminate()
 
     def to_dict(self) -> dict:
-        return {"kind": self.kind, "name": self.name, "sub": self.sub, "state": self.state, "phase": self.phase,
+        return {"kind": self.kind, "name": self.name, "sub": self.sub, "state": self.state, "reason": getattr(self, "reason", None), "phase": self.phase,
                 "image": self.image, "step": self.step, "eta": self.eta, "tile": self.tile,
                 "elapsed": round((self.ended or time.time()) - self.started), "log": self.lines[-40:]}
 

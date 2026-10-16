@@ -384,7 +384,8 @@ async function poll() {
     }
     if (j.state === "done") return openReview(j.name);
     m.classList.remove("indet");
-    $("phase").textContent = j.state === "cancelled" ? "중단됨" : "오류로 종료 — 로그를 확인하세요";
+    $("phase").textContent = j.reason === "disk" ? "디스크 공간 부족으로 중단됨 — 공간을 비운 뒤 다시 시도하세요"
+      : j.state === "cancelled" ? "중단됨" : "오류로 종료 — 로그를 확인하세요";
     if (j.kind === "upscale") return setTimeout(() => openReview(j.name), 1500);   // 2K 결과 화면으로 복귀
     // 생성 실패·중단: 진행 카드(로그)는 남기고 프롬프트 입력을 다시 연다
     $("s-progress").querySelector("details").open = j.state === "error";

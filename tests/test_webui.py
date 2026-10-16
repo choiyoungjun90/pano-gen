@@ -77,3 +77,15 @@ def test_job_refine_phase(tmp_path):
     wait(job)
     d = job.to_dict()
     assert d["phase"] == "refining" and d["tile"] == [3, 18] and d["image"] == [1, 2]
+
+
+def test_job_disk_guard(tmp_path, monkeypatch):
+    import shutil
+
+    import panogen.webui as w
+
+    monkeypatch.setattr(w, "MIN_FREE_GB", 1e9)    # 항상 부족한 것으로
+    job = Job("generate", [sys.executable, "-c", "import time; time.sleep(30)"], "x", tmp_path)
+    wait(job)
+    assert job.state == "cancelled" and job.to_dict()["reason"] == "disk"
+    assert any("디스크 여유" in ln for ln in job.lines)
