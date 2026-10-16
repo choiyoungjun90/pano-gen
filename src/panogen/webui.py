@@ -23,7 +23,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from panogen.config import Config
 
-MIN_FREE_GB = float(os.environ.get("PANOGEN_MIN_FREE_GB", 3))   # 이보다 디스크가 적으면 작업 중단
+MIN_FREE_GB = float(os.environ.get("PANOGEN_MIN_FREE_GB", 3))      # 이보다 디스크가 적으면 일시정지
+RESUME_FREE_GB = float(os.environ.get("PANOGEN_RESUME_FREE_GB", 6))  # 이만큼 비면 자동으로 이어서 (경계에서 멈춤·재개 반복 방지)
+
+
+def disk_free_gb(path: Path) -> float:
+    import shutil
+    return shutil.disk_usage(path).free / 1024**3
 TQDM = re.compile(r"(\d+)/(\d+) \[([\d:]+)<([\d:?]+)")
 IMG_IDX = re.compile(r"\((\d+)/(\d+)\)")
 TILE = re.compile(r"타일 (\d+)/(\d+)")
@@ -41,7 +47,10 @@ class Job:
 
     def __init__(self, kind: str, cmd: list[str], name: str, root: Path):
         self.kind, self.cmd, self.name = kind, cmd, name
-        self.state = "running"          # running | done | error | cancelled
+        self.state = "running"          # running | paused(디스크 부족) | done | error | cancelled
+        self.root = root
+        self.reason: str | None = None
+        self.free_gb: float | None = None
         self.phase = "starting"         # encoding | loading | generating | seam | postprocess | upscaling
         self.image = [0, 0]             # 몇 번째 이미지 / 전체
         self.step = [0, 0]              # 샘플링 step / 전체
@@ -59,18 +68,50 @@ class Job:
         threading.Thread(target=self._disk_guard, args=(root,), daemon=True).start()
 
     def _disk_guard(self, root: Path):
-        """디스크 여유가 MIN_FREE_GB 아래로 떨어지면 중단. 맥은 메모리가 모자라면 스왑이 디스크를 채워
-        (20B 모델 1장에 30GB 이상) 0 이 되면 시스템이 멈출 수 있음."""
-        import shutil
+        """맥은 메모리가 모자라면 스왑이 디스크를 채운다(20B 모델 1장에 30GB 이상). 0 이 되면 시스템이 멈출 수 있어서
+        여유가 MIN_FREE_GB 아래로 떨어지면 프로세스를 일시정지(메모리 요청이 멈춰 스왑도 더 늘지 않음)하고,
+        사용자가 공간을 비워 RESUME_FREE_GB 이상이 되면 자동으로 이어서 한다. 진행 상황은 그대로 유지."""
+        while self.state in ("running", "paused"):
+            self.free_gb = round(disk_free_gb(root), 1)
+            if self.state == "running" and self.free_gb < MIN_FREE_GB:
+                self.pause(f"디스크 여유 {self.free_gb}GB — {MIN_FREE_GB:g}GB 미만이라 일시정지했습니다. "
+                           f"공간을 비우면 {RESUME_FREE_GB:g}GB 이상에서 자동으로 이어집니다")
+            elif self.state == "paused" and self.reason == "disk" and self.free_gb >= RESUME_FREE_GB:
+                self.resume(f"디스크 여유 {self.free_gb}GB — 이어서 진행합니다")
+            time.sleep(2 if self.state == "paused" else 5)
 
-        while self.state == "running":
-            free = shutil.disk_usage(root).free / 1024**3
-            if free < MIN_FREE_GB:
-                self.lines.append(f"디스크 여유 {free:.1f}GB — {MIN_FREE_GB}GB 미만이라 작업을 중단했습니다 (스왑이 디스크를 채우는 중)")
-                self.cancel()
-                self.reason = "disk"
-                return
-            time.sleep(5)
+    def _procs(self):
+        """생성 프로세스와 그 자식들 (psutil)"""
+        import psutil
+
+        try:
+            p = psutil.Process(self.proc.pid)
+            return [p, *p.children(recursive=True)]
+        except psutil.Error:
+            return []
+
+    def pause(self, msg: str, reason: str = "disk"):
+        if self.state != "running":
+            return
+        for p in self._procs():
+            try:
+                p.suspend()
+            except Exception:
+                pass
+        self.state, self.reason, self.paused_at = "paused", reason, time.time()
+        self.lines.append(msg)
+
+    def resume(self, msg: str = "이어서 진행합니다"):
+        if self.state != "paused":
+            return
+        for p in reversed(self._procs()):
+            try:
+                p.resume()
+            except Exception:
+                pass
+        self.paused_total = getattr(self, "paused_total", 0) + time.time() - getattr(self, "paused_at", time.time())
+        self.state, self.reason = "running", None
+        self.lines.append(msg)
 
     def _read(self):
         buf = b""
@@ -131,6 +172,8 @@ class Job:
             self.step, self.eta = [int(m[1]), int(m[2])], m[4]
 
     def cancel(self):
+        if self.state == "paused":          # 정지된 프로세스는 종료 신호를 처리하지 못하므로 먼저 깨움
+            self.resume("중단합니다")
         if self.state == "running":
             self.state = "cancelled"
             self.proc.terminate()
@@ -138,7 +181,8 @@ class Job:
     def to_dict(self) -> dict:
         return {"kind": self.kind, "name": self.name, "sub": self.sub, "state": self.state, "reason": getattr(self, "reason", None), "phase": self.phase,
                 "image": self.image, "step": self.step, "eta": self.eta, "tile": self.tile,
-                "elapsed": round((self.ended or time.time()) - self.started), "log": self.lines[-40:]}
+                "elapsed": round((self.ended or time.time()) - self.started), "log": self.lines[-40:],
+                "free_gb": self.free_gb, "min_free_gb": MIN_FREE_GB, "resume_free_gb": RESUME_FREE_GB}
 
 
 def list_results(out_root: Path, name: str) -> list[dict]:
@@ -284,8 +328,12 @@ def serve(cfg: Config, port: int = 8370, extra_config: Path | None = None) -> No
     def start(kind: str, args: list[str], name: str) -> Job:
         with lock:
             j = state["job"]
-            if j and j.state == "running":
-                raise RuntimeError("이미 작업이 진행 중입니다.")
+            if j and j.state in ("running", "paused"):
+                raise RuntimeError("이미 작업이 진행 중입니다 (일시정지 포함).")
+            free = disk_free_gb(root)
+            if free < RESUME_FREE_GB:
+                raise RuntimeError(f"디스크 여유가 {free:.1f}GB 입니다. {RESUME_FREE_GB:g}GB 이상 비운 뒤 시작하세요 "
+                                   "(맥은 생성 중 스왑이 디스크를 수십 GB 씁니다).")
             state["job"] = Job(kind, base_cmd + [kind] + args, name, root)
             return state["job"]
 
@@ -442,6 +490,15 @@ def serve(cfg: Config, port: int = 8370, extra_config: Path | None = None) -> No
                     if body.get("limit"):
                         args += ["--limit", str(max(1, int(body["limit"])))]
                     return self._json(start("bench", args, tag).to_dict())
+                if u.path == "/api/resume":     # 디스크 일시정지에서 바로 이어서 (최소 여유는 넘어야 함)
+                    j = state["job"]
+                    if not j or j.state != "paused":
+                        raise ValueError("일시정지된 작업이 없습니다.")
+                    free = disk_free_gb(root)
+                    if free < MIN_FREE_GB:
+                        raise ValueError(f"디스크 여유가 아직 {free:.1f}GB 입니다. {MIN_FREE_GB:g}GB 이상 비워 주세요.")
+                    j.resume(f"디스크 여유 {free:.1f}GB — 직접 이어서 진행합니다")
+                    return self._json(j.to_dict())
                 if u.path == "/api/cancel":
                     if state["job"]:
                         state["job"].cancel()

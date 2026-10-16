@@ -112,6 +112,8 @@
   .attach input[type=range] { width: 160px; accent-color: var(--accent); }
   .input-ref { display: flex; gap: 10px; align-items: center; margin: -4px 0 12px; font-size: 13px; color: var(--muted); }
   .input-ref img { height: 56px; border-radius: 6px; cursor: zoom-in; }
+  .pause { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; padding: 12px 14px; border-radius: 10px;
+           border: 1px solid var(--warn, #c98a1b); background: color-mix(in srgb, var(--warn, #c98a1b) 10%, transparent); font-size: 14px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -135,10 +137,17 @@
     <div class="stats">
       <span id="st-img"></span><span id="st-step"></span><span id="st-eta"></span><span id="st-elapsed"></span>
     </div>
+    <div class="pause" id="pause-box" hidden>
+      <b>디스크 공간이 부족해 잠시 멈췄습니다</b>
+      <span id="pause-text"></span>
+      <span class="sub">생성 진행 상황은 그대로 있습니다. 다운로드 폴더·휴지통 등을 비우면 자동으로 이어집니다.</span>
+    </div>
     <div class="row">
       <span class="spacer"></span>
+      <button id="btn-resume" hidden>지금 이어서</button>
       <button id="btn-cancel">중단</button>
     </div>
+    <div class="msg err" id="prog-err" hidden></div>
     <details><summary class="sub">로그</summary><pre id="log"></pre></details>
   </section>
 
@@ -347,6 +356,14 @@ async function poll() {
   const j = await api("/api/job").catch(() => null);
   if (!j) return;
   const gen = GEN_KINDS.has(j.kind);
+  const live = j.state === "running" || j.state === "paused";   // 디스크 부족 일시정지도 진행 중
+  const paused = j.state === "paused";
+  $("pause-box").hidden = $("btn-resume").hidden = !paused;
+  if (paused) {
+    const need = Math.max(0, j.resume_free_gb - (j.free_gb ?? 0));
+    $("pause-text").textContent = `지금 여유 ${j.free_gb ?? "?"}GB · ${j.resume_free_gb}GB 가 되면 자동으로 이어집니다 (약 ${need.toFixed(1)}GB 더 필요)`;
+    $("btn-resume").disabled = (j.free_gb ?? 0) < j.min_free_gb;
+  }
   if (gen) { current.name = j.name; setStep(j.kind === "upscale" ? "up" : "gen"); }
   $("prog-title").textContent = (TITLE[j.kind] || j.kind) + (j.kind === "download" ? ` — ${j.name}` : "");
   $("phase").textContent = (j.kind === "bench" && j.sub ? `${j.sub.replace(/^bench_\d+_\d+_/, "")} · ` : "")
@@ -356,6 +373,7 @@ async function poll() {
   if ((j.phase === "generating" || j.phase === "seam") && j.step[1]) pct = j.step[0] / j.step[1];
   if ((j.phase === "upscaling" || j.phase === "refining") && j.tile[1]) pct = j.tile[0] / j.tile[1];
   m.classList.toggle("indet", pct === null && j.state === "running");
+  if (paused) $("phase").textContent = "일시정지 — 디스크 공간 부족";
   m.firstElementChild.style.width = pct === null ? "" : `${(pct * 100).toFixed(1)}%`;
   $("st-img").textContent = j.image[1] > 1 ? `이미지 ${j.image[0]}/${j.image[1]}` : "";
   if (j.phase === "refining" && j.tile[1]) $("st-img").textContent += ` 타일 ${j.tile[0]}/${j.tile[1]}`;
@@ -365,12 +383,12 @@ async function poll() {
   const pre = $("log"), atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
   pre.textContent = j.log.join("\n");
   if (atBottom) pre.scrollTop = pre.scrollHeight;
-  $("btn-cancel").disabled = j.state !== "running";
+  $("btn-cancel").disabled = !live;
 
   if (j.kind === "bench" && cmpTag === j.name && j.state === "running" && Date.now() - lastCmp > 10000) {
     lastCmp = Date.now(); openCompare(j.name, true);
   }
-  if (j.state !== "running") {
+  if (!live) {
     clearInterval(polling); polling = null;
     loadSessions();
     if (!gen) {   // 비교·모델 받기: 진행 카드는 결과 메시지와 함께 남김
@@ -394,6 +412,10 @@ async function poll() {
   }
 }
 $("btn-cancel").onclick = async () => { if (confirm("진행 중인 작업을 중단할까요?")) await api("/api/cancel", {}); };
+$("btn-resume").onclick = async () => {
+  $("prog-err").hidden = true;
+  try { await api("/api/resume", {}); poll(); } catch (e) { $("prog-err").textContent = e.message; $("prog-err").hidden = false; }
+};
 
 // ---------- 3. 확인 ----------
 async function openReview(name) {
@@ -643,7 +665,7 @@ async function openCompare(tag, quiet = false) {
   if (["cmp", "models"].includes(t)) setTab(t); }
 loadSessions();
 api("/api/job").then((j) => {
-  if (j && j.state === "running") { if (!GEN_KINDS.has(j.kind)) { show("prompt"); setStep("prompt"); if (j.kind === "bench") { setTab("cmp"); cmpTag = j.name; } } startPolling(j.kind); }
+  if (j && (j.state === "running" || j.state === "paused")) { if (!GEN_KINDS.has(j.kind)) { show("prompt"); setStep("prompt"); if (j.kind === "bench") { setTab("cmp"); cmpTag = j.name; } } startPolling(j.kind); }
   else { show("prompt"); setStep("prompt"); }
 });
 </script>

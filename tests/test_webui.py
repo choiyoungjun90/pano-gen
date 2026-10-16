@@ -79,13 +79,41 @@ def test_job_refine_phase(tmp_path):
     assert d["phase"] == "refining" and d["tile"] == [3, 18] and d["image"] == [1, 2]
 
 
-def test_job_disk_guard(tmp_path, monkeypatch):
-    import shutil
+def test_job_disk_guard_pause_resume(tmp_path, monkeypatch):
+    """디스크가 부족하면 일시정지(프로세스 suspend), 공간이 생기면 자동으로 이어서 끝까지."""
+    import psutil
 
     import panogen.webui as w
 
-    monkeypatch.setattr(w, "MIN_FREE_GB", 1e9)    # 항상 부족한 것으로
+    monkeypatch.setattr(w, "MIN_FREE_GB", 1e9)          # 항상 부족
+    monkeypatch.setattr(w, "RESUME_FREE_GB", 2e9)
+    job = Job("generate", [sys.executable, "-c", "import time; time.sleep(1.5); print('끝')"], "x", tmp_path)
+    t0 = time.time()
+    while job.state == "running" and time.time() - t0 < 5:
+        time.sleep(0.05)
+    assert job.state == "paused" and job.to_dict()["reason"] == "disk"
+    assert psutil.Process(job.proc.pid).status() == psutil.STATUS_STOPPED
+    assert any("일시정지" in ln for ln in job.lines)
+    time.sleep(2)                                        # 멈춰 있는 동안엔 끝나지 않음
+    assert job.state == "paused"
+    monkeypatch.setattr(w, "MIN_FREE_GB", 0)             # 공간이 생김
+    monkeypatch.setattr(w, "RESUME_FREE_GB", 0)
+    t0 = time.time()
+    while job.state in ("paused", "running") and time.time() - t0 < 10:   # 일시정지 → 재개 → 종료까지
+        time.sleep(0.05)
+    assert job.state == "done" and any("이어서" in ln for ln in job.lines)
+
+
+def test_job_cancel_while_paused(tmp_path, monkeypatch):
+    import panogen.webui as w
+
+    monkeypatch.setattr(w, "MIN_FREE_GB", 1e9)
+    monkeypatch.setattr(w, "RESUME_FREE_GB", 2e9)
     job = Job("generate", [sys.executable, "-c", "import time; time.sleep(30)"], "x", tmp_path)
-    wait(job)
-    assert job.state == "cancelled" and job.to_dict()["reason"] == "disk"
-    assert any("디스크 여유" in ln for ln in job.lines)
+    t0 = time.time()
+    while job.state == "running" and time.time() - t0 < 5:
+        time.sleep(0.05)
+    assert job.state == "paused"
+    job.cancel()
+    assert job.proc.wait(timeout=10) is not None      # 멈춘 프로세스도 깨운 뒤 종료됨
+    assert job.state == "cancelled"
