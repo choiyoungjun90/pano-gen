@@ -117,3 +117,39 @@ def test_job_cancel_while_paused(tmp_path, monkeypatch):
     job.cancel()
     assert job.proc.wait(timeout=10) is not None      # 멈춘 프로세스도 깨운 뒤 종료됨
     assert job.state == "cancelled"
+
+
+def test_list_results_draft_and_flat(tmp_path):
+    d = tmp_path / "run"
+    d.mkdir()
+    (d / "seed1_raw.png").write_bytes(b"x")                       # 이음새 보정 전 초안
+    (d / "seed1.json").write_text(json.dumps({"seed": 1, "prompt": "p", "seam_pending": True}), "utf-8")
+    (d / "seed2_raw.png").write_bytes(b"x")
+    (d / "seed2_2k.png").write_bytes(b"x")                        # 보정 끝
+    (d / "seed2.json").write_text(json.dumps({"seed": 2, "prompt": "p"}), "utf-8")
+    for k in (1, 2):
+        (d / f"input{k}.jpg").write_bytes(b"x")
+    items = {i["seed"]: i for i in list_results(tmp_path, "run")}
+    assert items[1]["seam_pending"] and items[1]["img2k"].endswith("seed1_raw.png")
+    assert not items[2]["seam_pending"] and items[2]["img2k"].endswith("seed2_2k.png") and items[2]["raw"]
+    assert items[1]["inputs"] == ["/outputs/run/input1.jpg", "/outputs/run/input2.jpg"]
+
+
+SEAM = r"""
+import sys
+w = sys.stdout.write
+w("[1/3] 텍스트 인코더 적재 (cpu) — qwen360 …\n")
+w("[seam] (2/2) seed3_raw.png · qwen360\n")
+w("      이음새 인페인팅 (비율 1.20배, strength 0.5) …\n")
+w("[2/3] 트랜스포머 적재 — qwen360 · 프로필 mps-16g (gguf) …\n")
+w("      준비 완료 (40s)\n")
+w("\r 25%|#  | 2/8 [01:00<03:00, 30.0s/it]")
+sys.stdout.flush()
+"""
+
+
+def test_job_seam_phase(tmp_path):
+    job = Job("upscale", [sys.executable, "-c", SEAM], "x", tmp_path, "seam")
+    wait(job)
+    d = job.to_dict()
+    assert d["label"] == "seam" and d["phase"] == "seam" and d["image"] == [2, 2] and d["step"] == [2, 8]

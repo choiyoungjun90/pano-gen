@@ -7,6 +7,7 @@ backend = "dit360"      # dit360 | qwen360 | klein360  (아래 [backends.*] 참�
 profile = "auto"        # auto | cuda-full | cuda-24g | cuda-12g | mps-16g
 width = 2048            # 세 백엔드 모두 2048×1024 로 학습됨 — 바꾸면 품질 저하
 height = 1024
+flat_base = 1024        # 일반 이미지(--type flat) 1:1 한 변. 다른 비율도 같은 면적(약 1MP)
 seed = -1               # -1 = 무작위
 # steps / guidance 를 여기 적으면 모든 백엔드에 강제 적용. 보통은 비워 두고 백엔드 기본값 사용
 upscale = false         # false: 2K 만 생성 → 확인 후 `panogen upscale <폴더> --seed N` / true: 생성 직후 8K 까지
@@ -71,6 +72,7 @@ tile = 512
 overlap = 32
 wrap_pad = 64
 half = true
+flat_scale = 4          # 일반 이미지(--type flat) 업스케일 배율 (이음새·순환 패딩 없음)
 
 [output]
 dir = "outputs"

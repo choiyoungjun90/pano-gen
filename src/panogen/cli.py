@@ -4,7 +4,11 @@
   panogen download                         모델 미리 받기 (FLUX.1-dev, DiT360 LoRA, 업스케일러)
   panogen generate -p "프롬프트"           2048×1024 생성 → 이음새 보정 (2K 까지, --upscale 이면 8K 까지)
   panogen generate --prompts list.txt -c 2 여러 프롬프트 × 시드 2개씩 일괄 생성
-  panogen upscale DIR --seed 1 3           2K 확인 후 고른 시드만 8K 로
+  panogen generate -p … --image a.jpg --image b.jpg   첨부 최대 3장 (프롬프트대로 고쳐서)
+  panogen generate -p … --type flat --aspect 16:9     일반 이미지 (360 아님)
+  panogen generate -p … --seam-later       이음새 보정 전 초안(seedN_raw.png)까지만 → 확인 후 upscale
+  panogen upscale DIR --seed 1 3           2K 확인 후 고른 시드만 8K 로 (초안이면 이음새 보정부터)
+  panogen upscale DIR --seed 1 --seam-only 초안의 이음새만 보정 (seedN_2k.png)
   panogen upscale IMAGE [IMAGE …]          기존 2K 파노라마를 8K 로
   panogen seam IMAGE [--roll|--unroll F]   이음새 검사·보정
   panogen ui [--port 8370]                 웹 UI (프롬프트 → 진행도 → 2K 확인 → 8K)
@@ -41,7 +45,17 @@ def slug(text: str, n: int = 32) -> str:
 
 # ---------- 후처리 (이음새 + 8K) ----------
 
-def finish(cfg: Config, img, out_dir: Path, stem: str, upscale_on: bool = True, save_2k: bool = True) -> dict:
+def seam_info(cfg: Config, arr) -> dict:
+    """이음새 검사만 (보정 없음) — 초안에도 판정을 붙여 확인 화면에 보여 줌."""
+    from panogen import seam
+
+    rep = seam.check(arr)
+    return {"seam_ratio": round(rep.ratio, 3), "seam_verdict": rep.verdict(float(cfg["seam"]["warn_ratio"]))}
+
+
+def finish(cfg: Config, img, out_dir: Path, stem: str, upscale_on: bool = True, save_2k: bool = True,
+           pano: bool = True) -> dict:
+    """2K 저장(파노라마면 이음새 검사·blend) → 선택: 업스케일. 일반 이미지는 이음새 없이 flat_scale 배로."""
     import numpy as np
 
     from panogen import seam
@@ -50,13 +64,14 @@ def finish(cfg: Config, img, out_dir: Path, stem: str, upscale_on: bool = True, 
 
     arr = np.asarray(img.convert("RGB")) if hasattr(img, "convert") else img
     s = cfg["seam"]
-    rep = seam.check(arr)
-    info = {"seam_ratio": round(rep.ratio, 3), "seam_verdict": rep.verdict(float(s["warn_ratio"]))}
-    log(f"      이음새 {rep.ratio:.2f}배 → {info['seam_verdict']}")
-    if rep.ratio >= float(s["warn_ratio"]):
-        arr = seam.blend(arr, int(s["band"]))
-        info["seam_after_blend"] = round(seam.check(arr).ratio, 3)
-        log(f"      blend 보정 → {info['seam_after_blend']:.2f}배")
+    info = {}
+    if pano:
+        info = seam_info(cfg, arr)
+        log(f"      이음새 {info['seam_ratio']:.2f}배 → {info['seam_verdict']}")
+        if info["seam_ratio"] >= float(s["warn_ratio"]):
+            arr = seam.blend(arr, int(s["band"]))
+            info["seam_after_blend"] = round(seam.check(arr).ratio, 3)
+            log(f"      blend 보정 → {info['seam_after_blend']:.2f}배")
     if save_2k:
         save_rgb(arr, out_dir / f"{stem}_2k.png")
 
@@ -64,8 +79,9 @@ def finish(cfg: Config, img, out_dir: Path, stem: str, upscale_on: bool = True, 
         return info
     u, o = cfg["upscale"], cfg["output"]
     model = cfg.get_path(u["model_path"]) if u.get("model_path") else None
-    big = upscale(arr, int(u["target_width"]), model, int(u["tile"]), int(u["overlap"]),
-                  int(u["wrap_pad"]), bool(u.get("half", True)), log=lambda m: log("      " + m))
+    target = int(u["target_width"]) if pano else arr.shape[1] * int(u.get("flat_scale", 4))
+    big = upscale(arr, target, model, int(u["tile"]), int(u["overlap"]),
+                  int(u["wrap_pad"]) if pano else 0, bool(u.get("half", True)), log=lambda m: log("      " + m))
     w = big.shape[1]
     tag = f"{w // 1024}k" if w % 1024 == 0 else f"{w}px"
     jpg = save_rgb(big, out_dir / f"{stem}_{tag}.jpg", int(o["jpeg_quality"]))
@@ -77,14 +93,14 @@ def finish(cfg: Config, img, out_dir: Path, stem: str, upscale_on: bool = True, 
 
 
 def inpaint_seam_if_needed(cfg: Config, eng, img, emb: dict, seed: int, out_dir: Path | None = None,
-                           stem: str = "") -> dict:
-    """생성형 이음새 보정 (설정 seam.inpaint). 결과 이미지는 'image' 키로 돌려줌."""
+                           stem: str = "", mode: str | None = None) -> dict:
+    """생성형 이음새 보정 (설정 seam.inpaint, mode 로 덮어쓰기). 결과 이미지는 'image' 키로 돌려줌."""
     import numpy as np
 
     from panogen import seam
 
     s = cfg["seam"]
-    mode = str(s.get("inpaint", "auto"))
+    mode = mode or str(s.get("inpaint", "auto"))
     if mode == "off" or not eng.can_inpaint:
         return {"image": img}
     before = seam.check(np.asarray(img.convert("RGB"))).ratio
@@ -183,26 +199,43 @@ def cmd_generate(cfg: Config, a) -> int:
         if ln.strip() and not ln.lstrip().startswith("#")]
     if not prompts:
         raise ValueError("프롬프트가 없습니다.")
+    pano = getattr(a, "type", "pano") != "flat"
+    images = [Path(x) for x in (getattr(a, "image", None) or [])]
+    if len(images) > 3:
+        raise ValueError("첨부 이미지는 최대 3장입니다.")
+
+    from panogen import imagein
+    from panogen.imageutil import load_rgb
+
+    arrs = [load_rgb(p) for p in images]
+    size = (int(g["width"]), int(g["height"])) if pano else imagein.flat_size(
+        getattr(a, "aspect", "auto") or "auto", arrs[0] if arrs else None, int(g.get("flat_base", 1024)))
 
     d = detect()
     prof = resolve(a.profile or g["profile"], d["device"], d["vram_gb"])
-    eng = Engine(cfg.root, cfg, prof, bf16=d["bf16"], log=log, backend=a.backend, fast=a.fast)
+    eng = Engine(cfg.root, cfg, prof, bf16=d["bf16"], log=log, backend=a.backend, fast=a.fast, pano=pano)
     b, s = eng.b, eng.sampling
     log(f"백엔드 {b['name']}{' (fast)' if eng.fast else ''} · 프로필 {prof.name} · {d['gpu']} · "
-        f"{int(g['width'])}×{int(g['height'])} · {s['steps']} steps")
+        f"{'360° 파노라마' if pano else '일반 이미지'} {size[0]}×{size[1]} · {s['steps']} steps")
     if prof.name == "mps-16g":
         log("  (맥 16GB 는 실험적입니다. 장당 수십 분 걸릴 수 있고, 다른 앱을 닫아 두세요)")
 
-    init, image = None, getattr(a, "image", None)
-    if image:
-        from panogen import imagein
-        from panogen.imageutil import load_rgb
-
-        init = imagein.prepare(load_rgb(Path(image)), int(g["width"]), int(g["height"]), a.strength, a.fov)
-        log(f"이미지 입력 {Path(image).name}: "
-            + ("2:1 파노라마 → 수정" if init.mode == "img2img" else f"일반 사진 → 360° 확장 (화각 {init.fov:.0f}°)")
-            + f", 원본 변경 정도 {init.strength}")
-    prefix = (b.get("image_prompt_prefix") or b.get("prompt_prefix", "")) if init else b.get("prompt_prefix", "")
+    init = None
+    if arrs:
+        if pano:
+            init = imagein.prepare(arrs, size[0], size[1], a.strength, a.fov)
+            kind = ("2:1 파노라마 → 수정" if init.mode == "img2img"
+                    else f"사진 {len(init.yaws)}장 → 360° 확장 (화각 {init.fov:.0f}°)")
+        else:
+            init = imagein.prepare_flat(arrs, size[0], size[1], a.strength)
+            kind = "첫 장을 바탕으로 수정"
+        if b["kind"] == "klein":
+            kind = f"참조 이미지 {len(arrs)}장"
+        log(f"이미지 입력 {', '.join(p.name for p in images)}: {kind}, 원본 변경 정도 {init.strength}")
+    if pano:
+        prefix = (b.get("image_prompt_prefix") or b.get("prompt_prefix", "")) if init else b.get("prompt_prefix", "")
+    else:
+        prefix = ""                               # 파노라마 트리거 문구 없이 프롬프트 그대로
     if getattr(a, "seed_list", None):     # bench: 지정한 시드 목록 그대로
         jobs = [Job(p, s, build_prompt(p, prefix)) for p in prompts for s in a.seed_list]
     else:
@@ -211,6 +244,9 @@ def cmd_generate(cfg: Config, a) -> int:
     emb_map = dict(zip(sorted({j.full_prompt for j in jobs}), embs))
 
     upscale_on = a.upscale or (bool(g.get("upscale", False)) and not a.no_upscale)
+    draft = pano and getattr(a, "seam_later", False)    # 이음새 보정 전 초안까지만 (확인 후 upscale)
+    if draft:
+        upscale_on = False
     out_root = cfg.get_path(cfg["output"]["dir"])
     made: dict[Path, list[int]] = {}
     for i, j in enumerate(jobs, 1):
@@ -222,26 +258,38 @@ def cmd_generate(cfg: Config, a) -> int:
             else f"p{prompts.index(j.prompt) + 1:02d}_seed{j.seed}"
         log(f"[3/3] ({i}/{len(jobs)}) {j.prompt[:60]}  seed={j.seed}")
         t0 = time.time()
-        if image and not any(out_dir.glob("input.*")):   # 결과 폴더에 원본 보관 (웹 UI 에서 비교)
+        if images and not any(out_dir.glob("input*.*")):   # 결과 폴더에 원본 보관 (웹 UI 에서 비교)
             import shutil
-            shutil.copy(image, out_dir / f"input{Path(image).suffix.lower()}")
-        img = eng.generate(emb_map[j.full_prompt], j.seed, init=init)
+            for k, p in enumerate(images, 1):
+                shutil.copy(p, out_dir / f"input{k}{p.suffix.lower()}")
+        img = eng.generate(emb_map[j.full_prompt], j.seed, init=init, size=size)
         gen_s = time.time() - t0
         log(f"      생성 {gen_s:.0f}s")
-        seam_info = inpaint_seam_if_needed(cfg, eng, img, emb_map[j.full_prompt], j.seed, out_dir, stem)
-        img = seam_info.pop("image")
-        info = {**seam_info, **finish(cfg, img, out_dir, stem, upscale_on=upscale_on)}
+        if draft:
+            import numpy as np
+
+            img.save(out_dir / f"{stem}_raw.png")
+            info = {**seam_info(cfg, np.asarray(img.convert("RGB"))), "seam_pending": True}
+            log(f"      초안 저장 (이음새 {info['seam_ratio']:.2f}배 → {info['seam_verdict']}) — 확인 후 이음새 보정")
+        elif pano:
+            seam_i = inpaint_seam_if_needed(cfg, eng, img, emb_map[j.full_prompt], j.seed, out_dir, stem)
+            img = seam_i.pop("image")
+            info = {**seam_i, **finish(cfg, img, out_dir, stem, upscale_on=upscale_on)}
+        else:
+            info = finish(cfg, img, out_dir, stem, upscale_on=upscale_on, pano=False)
         made.setdefault(out_dir, []).append(j.seed)
         meta = {"prompt": j.prompt, "full_prompt": j.full_prompt, "seed": j.seed, "backend": b["name"],
-                "fast": eng.fast, "profile": prof.name, **s, "size": [g["width"], g["height"]],
-                "model": b["base"], "lora": b["lora"], "generate_seconds": round(gen_s, 1),
-                "peak_memory_gb": peak_memory_gb(), "created": time.strftime("%Y-%m-%d %H:%M:%S"), **info}
+                "type": "pano" if pano else "flat", "fast": eng.fast, "profile": prof.name, **s,
+                "size": list(size), "model": b["base"], "lora": b["lora"] if pano else "",
+                "generate_seconds": round(gen_s, 1), "peak_memory_gb": peak_memory_gb(),
+                "created": time.strftime("%Y-%m-%d %H:%M:%S"), **info}
         if init:
-            meta["input"] = {"file": Path(image).name, "mode": init.mode, "strength": init.strength, "fov": init.fov}
+            meta["input"] = {"files": [p.name for p in images], "file": images[0].name, "mode": init.mode,
+                             "strength": init.strength, "fov": init.fov, "yaws": init.yaws, "unused": init.unused}
         (out_dir / f"{stem}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     log("완료.")
     if not upscale_on:
-        log("2K 결과를 확인한 뒤 마음에 드는 시드만 8K 로:")
+        log("결과를 확인한 뒤 마음에 드는 시드만 " + ("이음새 보정·8K 로:" if draft else "고해상도로:"))
         for d, seeds in made.items():
             log(f"  panogen upscale {d} --seed {' '.join(str(s) for s in dict.fromkeys(seeds))}")
     return 0
@@ -289,7 +337,8 @@ def cmd_bench(cfg: Config, a) -> int:
         save()
         ga = argparse.Namespace(prompt=None, prompts=pfile, name=r["dir"], count=1, seed=None, steps=None,
                                 profile=a.profile, backend=r["backend"], fast=r["fast"], upscale=False,
-                                no_upscale=True, seed_list=a.seeds, image=None, strength=None, fov=90.0)
+                                no_upscale=True, seed_list=a.seeds, image=None, strength=None, fov=90.0,
+                                type="pano", aspect="auto", seam_later=False)
         try:
             cmd_generate(copy.deepcopy(cfg), ga)
             r["status"] = "done"
@@ -306,7 +355,7 @@ def cmd_bench(cfg: Config, a) -> int:
 
 
 def _pick_2k(targets: list[str], seeds: list[int] | None) -> list[Path]:
-    """파일은 그대로, 폴더는 --seed 로 고른 *seedN_2k.png 를 찾는다."""
+    """파일은 그대로, 폴더는 --seed 로 고른 *seedN_2k.png 를 찾는다 (없으면 이음새 보정 전 초안 *seedN_raw.png)."""
     out: list[Path] = []
     for t in map(Path, targets):
         if t.is_file():
@@ -314,16 +363,73 @@ def _pick_2k(targets: list[str], seeds: list[int] | None) -> list[Path]:
             continue
         if not t.is_dir():
             raise FileNotFoundError(f"없음: {t}")
-        found = sorted(t.glob("*seed*_2k.png"))
-        avail = sorted({int(m.group(1)) for f in found if (m := re.search(r"seed(\d+)_2k$", f.stem))})
+        found = sorted(t.glob("*seed*_2k.png")) + sorted(t.glob("*seed*_raw.png"))
+        avail = sorted({int(m.group(1)) for f in found if (m := re.search(r"seed(\d+)_(2k|raw)$", f.stem))})
         if not seeds:
             raise ValueError(f"{t} 에서 8K 로 만들 시드를 --seed 로 고르세요. 있는 시드: "
                              f"{' '.join(map(str, avail)) or '(2K 결과 없음)'}")
         for s in seeds:
             hit = [f for f in found if re.search(rf"(^|_)seed{s}_2k$", f.stem)]
+            have = {f.stem.removesuffix("_2k") for f in hit}
+            hit += [f for f in found if re.search(rf"(^|_)seed{s}_raw$", f.stem) and f.stem.removesuffix("_raw") not in have]
             if not hit:
                 raise ValueError(f"{t} 에 seed{s} 2K 결과가 없습니다. 있는 시드: {' '.join(map(str, avail))}")
             out += hit
+    return out
+
+
+def _stem(src: Path) -> str:
+    return src.stem.removesuffix("_2k").removesuffix("_raw")
+
+
+def _meta(src: Path) -> dict:
+    mp = src.with_name(f"{_stem(src)}.json")
+    return json.loads(mp.read_text(encoding="utf-8")) if mp.exists() else {}
+
+
+def _seam_fix_all(cfg: Config, srcs: list[Path], arrs: dict, force: bool) -> dict[Path, Path]:
+    """이음새 보정 전 초안(*_raw.png)을 보정해 *_2k.png 로. 같은 백엔드끼리 모델을 한 번만 올림.
+    force: 비율이 낮아도 생성형 인페인팅 (사용자가 직접 고른 경우). 반환: 초안 → 보정본 경로."""
+    from panogen.device import detect, free_memory
+    from panogen.engine import Engine
+    from panogen.profiles import resolve
+
+    groups: dict[tuple, list[Path]] = {}
+    for src in srcs:
+        m = _meta(src)
+        groups.setdefault((m.get("backend", "dit360"), bool(m.get("fast"))), []).append(src)
+    d = detect()
+    prof = resolve(cfg["generate"]["profile"], d["device"], d["vram_gb"])
+    out = {}
+    for (backend, fast), group in groups.items():
+        eng = Engine(cfg.root, cfg, prof, bf16=d["bf16"], log=log, backend=backend, fast=fast)
+        metas = [_meta(s) for s in group]
+        prompts = [m.get("full_prompt") or m.get("prompt") or "" for m in metas]
+        embs = eng.encode(prompts)
+        for i, (src, m, emb) in enumerate(zip(group, metas, embs), 1):
+            log(f"[seam] ({i}/{len(group)}) {src.name} · {backend}{' (fast)' if fast else ''}")
+            from PIL import Image
+
+            # DiT360 텍스트 생성본은 추론 중 순환 패딩으로 이미 이어져 있어 인페인팅 대신 blend 만
+            eng.circular = eng.b["kind"] == "dit360" and not m.get("input")
+            img = Image.fromarray(arrs[src])
+            si = inpaint_seam_if_needed(cfg, eng, img, emb, int(m.get("seed", 0)),
+                                        mode="always" if force else None)
+            stem = _stem(src)
+            info = {**{k: v for k, v in si.items() if k != "image"},
+                    **finish(cfg, si["image"], src.parent, stem, upscale_on=False)}
+            dst = src.with_name(f"{stem}_2k.png")
+            from panogen.imageutil import load_rgb
+
+            arrs[dst] = load_rgb(dst)
+            mp = src.with_name(f"{stem}.json")
+            if mp.exists():
+                meta = json.loads(mp.read_text(encoding="utf-8"))
+                meta.update(seam_pending=False, seam_fixed=time.strftime("%Y-%m-%d %H:%M:%S"), **info)
+                mp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            out[src] = dst
+        del eng
+        free_memory()
     return out
 
 
@@ -338,8 +444,7 @@ def _refine_all(cfg: Config, srcs: list[Path], arrs: dict, a) -> dict:
     strength = float(a.strength if a.strength is not None else r.get("strength", 0.3))
     metas = {}
     for src in srcs:
-        mp = src.with_name(f"{src.stem.removesuffix('_2k')}.json")
-        m = json.loads(mp.read_text(encoding="utf-8")) if mp.exists() else {}
+        m = _meta(src)
         if not m.get("prompt"):
             raise ValueError(f"{src.name}: 디테일 강화에는 생성 기록(seedN.json 의 prompt)이 필요합니다.")
         metas[src] = m
@@ -372,18 +477,28 @@ def cmd_upscale(cfg: Config, a) -> int:
     arrs = {}
     for src in srcs:
         arrs[src] = load_rgb(src)
-        if (w := check_ratio(arrs[src])):
+        if _meta(src).get("type", "pano") == "pano" and (w := check_ratio(arrs[src])):
             log(f"경고: {src.name}: {w}")
-    refined = _refine_all(cfg, srcs, arrs, a) if a.refine else {}
+    drafts = [s for s in srcs if s.stem.endswith("_raw")]
+    if drafts:      # 이음새 보정 전 초안 → 먼저 보정 (확인 화면에서 직접 고른 경우는 생성형 인페인팅 강제)
+        fixed = _seam_fix_all(cfg, drafts, arrs, force=getattr(a, "seam_only", False))
+        srcs = [fixed.get(s, s) for s in srcs]
+    if getattr(a, "seam_only", False):
+        log("이음새 보정 완료.")
+        return 0
+    flat = [s for s in srcs if _meta(s).get("type") == "flat"]
+    if a.refine and flat:
+        log(f"디테일 강화는 360° 파노라마만 지원 — 일반 이미지 {len(flat)}장은 업스케일만 합니다")
+    refined = _refine_all(cfg, [s for s in srcs if s not in flat], arrs, a) if a.refine else {}
     for i, src in enumerate(srcs, 1):
         arr, extra = refined.get(src, (arrs[src], {}))
         out_dir = Path(a.out) if a.out else src.parent
         out_dir.mkdir(parents=True, exist_ok=True)
-        stem = src.stem.removesuffix("_2k")
+        stem = _stem(src)
         log(f"[upscale] ({i}/{len(srcs)}) {src.name} {arr.shape[1]}×{arr.shape[0]}")
         t0 = time.time()
-        info = finish(cfg, arr, out_dir, stem, upscale_on=True, save_2k=False)
-        # generate 가 남긴 seedN.json 에 8K 결과를 이어 기록 (이음새 값은 생성 시점 것을 유지)
+        info = finish(cfg, arr, out_dir, stem, upscale_on=True, save_2k=False, pano=src not in flat)
+        # generate 가 남긴 seedN.json 에 결과를 이어 기록 (이음새 값은 생성·보정 시점 것을 유지)
         meta_p = src.with_name(f"{stem}.json")
         if meta_p.exists():
             meta = json.loads(meta_p.read_text(encoding="utf-8"))
@@ -441,12 +556,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--profile", choices=["auto", "cuda-full", "cuda-24g", "cuda-12g", "mps-16g"])
     p.add_argument("--backend", help="dit360 | qwen360 | klein360 (기본: 설정의 model.backend)")
     p.add_argument("--fast", action="store_true", help="속도 LoRA(예: Qwen Lightning 8 step) 사용 — 빠르지만 품질 확인 필요")
-    p.add_argument("--image", type=Path, help="첨부 이미지: 프롬프트대로 고쳐 360° 로 (2:1 파노라마는 수정, 일반 사진은 확장)")
-    p.add_argument("--strength", type=float, help="원본 변경 정도 0~1 (기본: 파노라마 0.6, 사진 0.3)")
+    p.add_argument("--type", choices=["pano", "flat"], default="pano", help="pano = 360° 파노라마(기본), flat = 일반 이미지")
+    p.add_argument("--aspect", default="auto", help="일반 이미지 비율: auto(첨부 첫 장 비율, 없으면 1:1) | 1:1 4:3 3:4 3:2 2:3 16:9 9:16")
+    p.add_argument("--image", type=Path, action="append", help="첨부 이미지 (최대 3번): 프롬프트대로 고쳐서. "
+                   "360 이면 2:1 파노라마는 수정, 일반 사진은 방향을 나눠 배치 후 확장 / klein 은 전부 참조")
+    p.add_argument("--strength", type=float, help="원본 변경 정도 0~1 (기본: 파노라마·일반 이미지 0.6, 사진→360 0.3)")
     p.add_argument("--fov", type=float, default=90.0, help="일반 사진의 가로 화각(도). 폰 기본 카메라 ≈ 70~80, 광각 ≈ 100~120")
     up = p.add_mutually_exclusive_group()
     up.add_argument("--upscale", action="store_true", help="확인 없이 생성 직후 8K 까지")
     up.add_argument("--no-upscale", action="store_true", help="2K 까지만 (설정 generate.upscale = true 를 무시)")
+    p.add_argument("--seam-later", action="store_true", help="360: 이음새 보정 전 초안(seedN_raw.png)까지만 — 확인 후 upscale")
 
     p = sub.add_parser("bench", help="여러 백엔드를 같은 프롬프트·시드로 비교 생성")
     p.add_argument("--backends", default="dit360,qwen360", help="쉼표 구분, 이름 뒤 :fast 면 속도 LoRA (예: qwen360:fast)")
@@ -460,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("targets", nargs="+", metavar="DIR|IMAGE", help="generate 출력 폴더 또는 2:1 이미지")
     p.add_argument("--seed", type=int, nargs="+", help="폴더에서 8K 로 만들 시드")
     p.add_argument("--refine", action="store_true", help="생성형 디테일 강화 (2K→4K 같은 모델 타일 img2img, 느림)")
+    p.add_argument("--seam-only", action="store_true", help="초안(*_raw.png)의 이음새만 보정하고 끝 (8K 안 함)")
     p.add_argument("--strength", type=float, help="디테일 강화 강도 (기본 refine.strength)")
     p.add_argument("-o", "--out")
 

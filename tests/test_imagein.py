@@ -1,6 +1,6 @@
 import numpy as np
 
-from panogen.imagein import is_panorama, photo_to_equirect, prepare
+from panogen.imagein import flat_size, is_panorama, photo_to_equirect, prepare, prepare_flat, yaws_for
 
 
 def test_panorama_detection():
@@ -23,3 +23,30 @@ def test_prepare_modes():
     assert pano.mode == "img2img" and pano.image.shape == (128, 256, 3) and pano.strength == 0.6
     photo = prepare(np.zeros((300, 400, 3), np.uint8), 256, 128, strength=0.0, fov=70)
     assert photo.mode == "outpaint" and photo.mask.shape == (128, 256) and photo.fov == 70 and photo.strength == 0.0
+
+
+def test_photo_yaw_moves_photo():
+    photo = np.full((100, 100, 3), 255, np.uint8)
+    _, mask = photo_to_equirect(photo, 360, 180, hfov=60, yaw=90)
+    cols = np.nonzero(mask[90] == 0)[0]
+    assert abs(cols.mean() - 270) < 3                    # 정면(180) 에서 오른쪽 90° → 270
+
+
+def test_prepare_multi_photos_and_panorama_priority():
+    photos = [np.full((60, 80, 3), v, np.uint8) for v in (50, 150, 250)]
+    init = prepare(photos, 360, 180, fov=100)
+    assert init.mode == "outpaint" and init.yaws == yaws_for(3) == [0, 120, 240]
+    assert init.fov <= 116 and len(init.sources) == 3
+    for yaw, v in zip(init.yaws, (50, 150, 250)):          # 각 방향 가운데에 그 사진 색
+        x = int((180 + yaw) % 360)
+        assert init.mask[90, x] == 0 and abs(int(init.image[90, x, 0]) - v) <= 2
+    mixed = prepare([photos[0], np.zeros((100, 200, 3), np.uint8)], 256, 128)
+    assert mixed.mode == "img2img" and mixed.unused == 1   # 파노라마가 있으면 그걸 고치고 나머지는 klein 참조로만
+
+
+def test_flat_size_and_prepare_flat():
+    assert flat_size("1:1") == (1024, 1024) and flat_size("16:9") == (1344, 768)
+    assert flat_size("auto", np.zeros((1920, 1080, 3), np.uint8)) == (768, 1344)
+    assert flat_size("auto") == (1024, 1024) and flat_size("4:3", base=128) == (144, 112)
+    init = prepare_flat([np.zeros((300, 600, 3), np.uint8), np.zeros((10, 10, 3), np.uint8)], 128, 128)
+    assert init.image.shape == (128, 128, 3) and init.strength == 0.6 and init.unused == 1

@@ -1,4 +1,5 @@
-"""로컬 웹 UI — 프롬프트 입력 → 진행도 → 2K 확인(컨펌/수정) → 고른 시드만 8K.
+"""로컬 웹 UI — 프롬프트(+첨부 최대 3장) → 진행도 → 초안 확인(컨펌/수정) → 이음새 보정 → 고른 시드만 8K.
+360° 파노라마와 일반 이미지(--type flat) 둘 다. 일반 이미지는 이음새 단계 없이 확인 → 고해상도.
 
   panogen ui [--port 8370]      → http://127.0.0.1:8370/
 
@@ -22,6 +23,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from panogen.config import Config
+from panogen.imagein import ASPECTS
 
 MIN_FREE_GB = float(os.environ.get("PANOGEN_MIN_FREE_GB", 3))      # 이보다 디스크가 적으면 일시정지
 RESUME_FREE_GB = float(os.environ.get("PANOGEN_RESUME_FREE_GB", 6))  # 이만큼 비면 자동으로 이어서 (경계에서 멈춤·재개 반복 방지)
@@ -45,8 +47,9 @@ def slug(text: str, n: int = 24) -> str:
 class Job:
     """하위 프로세스 하나의 상태. 출력 줄을 읽으며 phase/step 을 갱신."""
 
-    def __init__(self, kind: str, cmd: list[str], name: str, root: Path):
+    def __init__(self, kind: str, cmd: list[str], name: str, root: Path, label: str | None = None):
         self.kind, self.cmd, self.name = kind, cmd, name
+        self.label = label or kind      # 화면 제목용 (upscale --seam-only → "seam")
         self.state = "running"          # running | paused(디스크 부족) | done | error | cancelled
         self.root = root
         self.reason: str | None = None
@@ -153,6 +156,10 @@ class Job:
                 self.phase = "generating"
         elif GEN_DONE.match(s):
             self.phase = "postprocess"
+        elif s.startswith("[seam]"):          # 초안 이음새 보정 (upscale 의 앞단계)
+            if (m := IMG_IDX.search(s)):
+                self.image = [int(m[1]), int(m[2])]
+            self.phase, self.step, self.tile, self.in_seam = "seam", [0, 0], [0, 0], True
         elif "이음새 인페인팅 (" in s:
             self.phase, self.step, self.in_seam = "seam", [0, 0], True
         elif "이음새 인페인팅 완료" in s:
@@ -179,29 +186,35 @@ class Job:
             self.proc.terminate()
 
     def to_dict(self) -> dict:
-        return {"kind": self.kind, "name": self.name, "sub": self.sub, "state": self.state, "reason": getattr(self, "reason", None), "phase": self.phase,
+        return {"kind": self.kind, "label": self.label, "name": self.name, "sub": self.sub, "state": self.state, "reason": getattr(self, "reason", None), "phase": self.phase,
                 "image": self.image, "step": self.step, "eta": self.eta, "tile": self.tile,
                 "elapsed": round((self.ended or time.time()) - self.started), "log": self.lines[-40:],
                 "free_gb": self.free_gb, "min_free_gb": MIN_FREE_GB, "resume_free_gb": RESUME_FREE_GB}
 
 
 def list_results(out_root: Path, name: str) -> list[dict]:
+    """결과 목록. 360 초안(이음새 보정 전 *_raw.png)과 보정본(*_2k.png)·일반 이미지(*_2k.png)를 한 줄씩."""
     d = out_root / name
+    url = lambda f: f"/outputs/{name}/{f.name}"
+    inputs = [url(f) for f in sorted(d.glob("input*.*")) if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")]
+    stems = sorted({f.stem.removesuffix("_2k") for f in d.glob("*_2k.png")} |
+                   {f.stem.removesuffix("_raw") for f in d.glob("*_raw.png")})
     items = []
-    inp = sorted(d.glob("input.*"))
-    inp_url = f"/outputs/{name}/{inp[0].name}" if inp else None
-    for f in sorted(d.glob("*_2k.png")):
-        stem = f.stem.removesuffix("_2k")
+    for stem in stems:
         meta_p = d / f"{stem}.json"
         meta = json.loads(meta_p.read_text(encoding="utf-8")) if meta_p.exists() else {}
+        fixed, raw = d / f"{stem}_2k.png", d / f"{stem}_raw.png"
         big = sorted(d.glob(f"{stem}_*k.jpg")) + sorted(d.glob(f"{stem}_*px.jpg"))
         items.append({"stem": stem, "seed": meta.get("seed"), "prompt": meta.get("prompt", ""),
+                      "type": meta.get("type", "pano"), "size": meta.get("size"),
                       "backend": meta.get("backend", "dit360"), "fast": meta.get("fast", False),
                       "refined": meta.get("refined", False),
                       "seam": meta.get("seam_verdict"), "seconds": meta.get("generate_seconds"),
                       "peak_gb": meta.get("peak_memory_gb"), "steps": meta.get("steps"),
-                      "img2k": f"/outputs/{name}/{f.name}", "input": inp_url, "input_meta": meta.get("input"),
-                      "img8k": f"/outputs/{name}/{big[0].name}" if big else None})
+                      "seam_pending": not fixed.exists(), "inpainted": bool(meta.get("seam_inpaint")),
+                      "img2k": url(fixed if fixed.exists() else raw), "raw": url(raw) if raw.exists() else None,
+                      "input": inputs[0] if inputs else None, "inputs": inputs, "input_meta": meta.get("input"),
+                      "img8k": url(big[0]) if big else None})
     return items
 
 
@@ -213,7 +226,8 @@ def list_sessions(out_root: Path) -> list[dict]:
             continue
         m = json.loads(metas[0].read_text(encoding="utf-8"))
         prompt = m.get("prompt", "")
-        out.append({"name": d.name, "prompt": prompt, "count": len(list(d.glob("*_2k.png"))),
+        stems = {f.stem.removesuffix("_2k") for f in d.glob("*_2k.png")} | {f.stem.removesuffix("_raw") for f in d.glob("*_raw.png")}
+        out.append({"name": d.name, "prompt": prompt, "count": len(stems), "type": m.get("type", "pano"),
                     "backend": m.get("backend", "dit360") + (" fast" if m.get("fast") else ""),
                     "mtime": time.strftime("%m-%d %H:%M", time.localtime(d.stat().st_mtime))})
     return out[:30]
@@ -325,7 +339,7 @@ def serve(cfg: Config, port: int = 8370, extra_config: Path | None = None) -> No
     except Exception:
         gguf = False
 
-    def start(kind: str, args: list[str], name: str) -> Job:
+    def start(kind: str, args: list[str], name: str, label: str | None = None) -> Job:
         with lock:
             j = state["job"]
             if j and j.state in ("running", "paused"):
@@ -334,7 +348,7 @@ def serve(cfg: Config, port: int = 8370, extra_config: Path | None = None) -> No
             if free < RESUME_FREE_GB:
                 raise RuntimeError(f"디스크 여유가 {free:.1f}GB 입니다. {RESUME_FREE_GB:g}GB 이상 비운 뒤 시작하세요 "
                                    "(맥은 생성 중 스왑이 디스크를 수십 GB 씁니다).")
-            state["job"] = Job(kind, base_cmd + [kind] + args, name, root)
+            state["job"] = Job(kind, base_cmd + [kind] + args, name, root, label)
             return state["job"]
 
     class Handler(SimpleHTTPRequestHandler):
@@ -452,15 +466,26 @@ def serve(cfg: Config, port: int = 8370, extra_config: Path | None = None) -> No
                         args += ["--seed", str(int(body["seed"]))]
                     if body.get("steps") not in (None, ""):
                         args += ["--steps", str(max(1, min(60, int(body["steps"]))))]
-                    if body.get("image"):
-                        fid = str(body["image"])
+                    kind = "flat" if body.get("type") == "flat" else "pano"
+                    if kind == "flat":
+                        aspect = str(body.get("aspect") or "auto")
+                        if aspect != "auto" and aspect not in ASPECTS:
+                            raise ValueError(f"알 수 없는 비율: {aspect}")
+                        args += ["--type", "flat", "--aspect", aspect]
+                    else:
+                        args.append("--seam-later")      # 이음새 보정 전 초안을 먼저 확인
+                    ids = body.get("images") or ([body["image"]] if body.get("image") else [])
+                    if len(ids) > 3:
+                        raise ValueError("첨부 이미지는 최대 3장입니다.")
+                    for fid in map(str, ids):
                         img = out_root / "_uploads" / fid
                         if not re.fullmatch(r"[\w\-]+\.(jpg|png|webp)", fid) or not img.is_file():
                             raise ValueError("첨부 이미지를 다시 올려 주세요.")
                         args += ["--image", str(img)]
+                    if ids:
                         if body.get("strength") not in (None, ""):
                             args += ["--strength", str(max(0.0, min(1.0, float(body["strength"]))))]
-                        if body.get("fov") not in (None, ""):
+                        if kind == "pano" and body.get("fov") not in (None, ""):
                             args += ["--fov", str(max(30.0, min(170.0, float(body["fov"]))))]
                     return self._json(start("generate", args, name).to_dict())
                 if u.path == "/api/upscale":
@@ -468,8 +493,10 @@ def serve(cfg: Config, port: int = 8370, extra_config: Path | None = None) -> No
                     seeds = [str(int(s)) for s in body.get("seeds", [])]
                     if not seeds or "/" in name or ".." in name or not (out_root / name).is_dir():
                         raise ValueError("8K 로 만들 시드를 고르세요.")
-                    args = [str(out_root / name), "--seed", *seeds] + (["--refine"] if body.get("refine") else [])
-                    return self._json(start("upscale", args, name).to_dict())
+                    seam_only = bool(body.get("seam_only"))
+                    args = [str(out_root / name), "--seed", *seeds] + (["--refine"] if body.get("refine") else []) \
+                        + (["--seam-only"] if seam_only else [])
+                    return self._json(start("upscale", args, name, "seam" if seam_only else None).to_dict())
                 if u.path == "/api/download":
                     be = str(body.get("backend", ""))
                     if be not in backends:

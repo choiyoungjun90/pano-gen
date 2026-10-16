@@ -224,7 +224,7 @@ def test_cli_upscale_refine(tiny_repo, tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("shape,mode", [((48, 64), "outpaint"), ((64, 128), "img2img")])
 def test_cli_generate_with_image(tiny_repo, tmp_path, monkeypatch, shape, mode):
-    """--image: 일반 사진은 360° 확장, 2:1 파노라마는 수정. 원본은 결과 폴더에 input.* 로 보관."""
+    """--image: 일반 사진은 360° 확장, 2:1 파노라마는 수정. 원본은 결과 폴더에 input1.* 로 보관."""
     import json
 
     import numpy as np
@@ -249,9 +249,110 @@ def test_cli_generate_with_image(tiny_repo, tmp_path, monkeypatch, shape, mode):
     assert main(["--config", str(conf), "generate", "-p", "misty temple", "--seed", "2", "-n", "img",
                  "--image", str(src), "--strength", "0.5"]) == 0
     d = out / "img"
-    assert (d / "seed2_2k.png").exists() and (d / "input.jpg").exists()
+    assert (d / "seed2_2k.png").exists() and (d / "input1.jpg").exists()
     meta = json.loads((d / "seed2.json").read_text(encoding="utf-8"))
     assert meta["input"]["mode"] == mode and meta["input"]["strength"] == 0.5
+
+
+def _cli_env(tiny_repo, tmp_path, monkeypatch, seam="off"):
+    import panogen.device as dev
+    import panogen.profiles as profs
+    from panogen.profiles import Profile
+
+    base, lora = tiny_repo
+    monkeypatch.setattr(dev, "detect", lambda: {"device": "cpu", "vram_gb": None, "gpu": "test", "bf16": True})
+    monkeypatch.setattr(profs, "resolve", lambda *a: Profile("cpu-test", "cpu", "bf16", "cpu", False, 0, ""))
+    out = tmp_path / "out"
+    conf = tmp_path / "t.toml"
+    conf.write_text(
+        f'[backends.dit360]\nbase = "{base.as_posix()}"\nlora = "{lora.as_posix()}"\nsteps = 2\n'
+        f'[generate]\nwidth = 128\nheight = 64\nmax_sequence_length = 64\nflat_base = 128\n'
+        f'[seam]\ninpaint = "{seam}"\n[upscale]\nmodel_path = ""\ntarget_width = 256\n'
+        f'[output]\ndir = "{out.as_posix()}"\nsave_png = false\n', encoding="utf-8")
+    return out, conf
+
+
+def _photo(path, shape, seed=0):
+    import numpy as np
+    from PIL import Image
+
+    Image.fromarray(np.random.default_rng(seed).integers(0, 255, (*shape, 3), dtype=np.uint8)).save(path)
+    return str(path)
+
+
+def test_cli_three_photos_spread_around(tiny_repo, tmp_path, monkeypatch):
+    """사진 3장 → 0°·120°·240° 에 배치해 360° 확장, 원본 3장 보관."""
+    import json
+
+    from panogen.cli import main
+
+    out, conf = _cli_env(tiny_repo, tmp_path, monkeypatch)
+    imgs = [_photo(tmp_path / f"p{i}.jpg", (60, 80), i) for i in range(3)]
+    args = ["--config", str(conf), "generate", "-p", "misty temple", "--seed", "1", "-n", "three"]
+    for im in imgs:
+        args += ["--image", im]
+    assert main(args) == 0
+    d = out / "three"
+    assert all((d / f"input{k}.jpg").exists() for k in (1, 2, 3))
+    meta = json.loads((d / "seed1.json").read_text(encoding="utf-8"))
+    assert meta["input"]["mode"] == "outpaint" and meta["input"]["yaws"] == [0, 120, 240]
+    assert len(meta["input"]["files"]) == 3
+    assert main(args[:-2] + ["--image", imgs[0], "--image", imgs[0], "--image", imgs[0], "--image", imgs[0]]) == 1   # 4장은 거절
+
+
+def test_cli_flat_image(tiny_repo, tmp_path, monkeypatch):
+    """일반 이미지: 파노라마 LoRA·트리거 문구 없이 지정 비율, 업스케일은 flat_scale 배 (순환 패딩 없음)."""
+    import json
+
+    from PIL import Image
+
+    from panogen.cli import main
+
+    out, conf = _cli_env(tiny_repo, tmp_path, monkeypatch)
+    assert main(["--config", str(conf), "generate", "-p", "misty temple", "--seed", "4", "-n", "flat",
+                 "--type", "flat", "--aspect", "16:9"]) == 0
+    d = out / "flat"
+    meta = json.loads((d / "seed4.json").read_text(encoding="utf-8"))
+    assert meta["type"] == "flat" and meta["full_prompt"] == "misty temple" and meta["lora"] == ""
+    assert Image.open(d / "seed4_2k.png").size == tuple(meta["size"]) == (160, 96)
+    assert "seam_verdict" not in meta
+    assert main(["--config", str(conf), "upscale", str(d), "--seed", "4"]) == 0
+    big = sorted(d.glob("seed4_*px.jpg"))
+    assert big and Image.open(big[0]).size == (160 * 4, 96 * 4)
+
+
+def test_cli_flat_with_image_auto_aspect(tiny_repo, tmp_path, monkeypatch):
+    import json
+
+    from panogen.cli import main
+
+    out, conf = _cli_env(tiny_repo, tmp_path, monkeypatch)
+    src = _photo(tmp_path / "tall.jpg", (160, 90))           # 세로 사진 → 9:16
+    assert main(["--config", str(conf), "generate", "-p", "misty temple", "--seed", "2", "-n", "fi",
+                 "--type", "flat", "--image", src]) == 0
+    meta = json.loads((out / "fi" / "seed2.json").read_text(encoding="utf-8"))
+    assert meta["input"]["mode"] == "img2img" and meta["size"][0] < meta["size"][1]
+
+
+def test_cli_seam_later_then_fix(tiny_repo, tmp_path, monkeypatch):
+    """360 초안: 이음새 보정 전 *_raw.png 만 → upscale --seam-only 로 *_2k.png 생성, 초안은 남김."""
+    import json
+
+    from panogen.cli import main
+
+    out, conf = _cli_env(tiny_repo, tmp_path, monkeypatch, seam="auto")
+    src = _photo(tmp_path / "p.jpg", (60, 80))
+    assert main(["--config", str(conf), "generate", "-p", "misty temple", "--seed", "3", "-n", "draft",
+                 "--image", src, "--seam-later"]) == 0
+    d = out / "draft"
+    assert (d / "seed3_raw.png").exists() and not (d / "seed3_2k.png").exists()
+    meta = json.loads((d / "seed3.json").read_text(encoding="utf-8"))
+    assert meta["seam_pending"] is True and "seam_verdict" in meta
+    assert main(["--config", str(conf), "upscale", str(d), "--seed", "3", "--seam-only"]) == 0
+    assert (d / "seed3_2k.png").exists() and (d / "seed3_raw.png").exists()
+    meta = json.loads((d / "seed3.json").read_text(encoding="utf-8"))
+    assert meta["seam_pending"] is False and meta["seam_inpaint"]["after"] >= 0     # 직접 고른 보정은 생성형 인페인팅
+    assert not list(d.glob("seed3_*k.jpg"))                                          # --seam-only 는 8K 안 함
 
 
 def test_mps_drops_transformer_before_decode(tiny_repo):

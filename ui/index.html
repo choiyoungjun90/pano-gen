@@ -73,9 +73,10 @@
   .msg.err { color: var(--err); }
 
   .sessions { display: grid; gap: 6px; }
-  .sessions button { text-align: left; display: flex; gap: 10px; align-items: baseline; border-color: transparent; background: var(--bg); }
+  .sessions button { text-align: left; display: flex; gap: 10px; align-items: baseline; border-color: transparent; background: var(--bg); min-width: 0; }
+  .sessions .tag { white-space: nowrap; }
   .sessions .t { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .sessions .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sessions .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 
   #viewer { position: fixed; inset: 0; background: #000; display: none; z-index: 10; }
   #viewer.open { display: block; }
@@ -107,11 +108,21 @@
   .attach { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; padding: 10px;
             border: 1px dashed var(--line); border-radius: 10px; }
   .attach.drag { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
-  .attach img { height: 72px; max-width: 200px; object-fit: cover; border-radius: 6px; display: block; }
+  .thumbs { display: flex; gap: 8px; flex-wrap: wrap; }
+  .thumb { position: relative; }
+  .thumb img { height: 72px; max-width: 160px; object-fit: cover; border-radius: 6px; display: block; }
+  .thumb .n { position: absolute; left: 4px; top: 4px; font-size: 11px; padding: 0 6px; border-radius: 999px; background: rgba(0,0,0,.6); color: #fff; }
+  .thumb button { position: absolute; right: 3px; top: 3px; width: 22px; height: 22px; padding: 0; border-radius: 50%; font-size: 13px; line-height: 1;
+                  background: rgba(0,0,0,.6); color: #fff; border-color: transparent; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; padding: 2px; background: var(--bg); }
+  .seg button { border: 0; background: transparent; color: var(--muted); padding: 6px 12px; border-radius: 7px; }
+  .seg button.on { background: var(--panel); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+  .pano.flat img { aspect-ratio: auto; max-height: 420px; object-fit: contain; }
   .attach .info { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
   .attach input[type=range] { width: 160px; accent-color: var(--accent); }
   .input-ref { display: flex; gap: 10px; align-items: center; margin: -4px 0 12px; font-size: 13px; color: var(--muted); }
   .input-ref img { height: 56px; border-radius: 6px; cursor: zoom-in; }
+  .note { font-size: 12px; color: var(--muted); }
   .pause { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; padding: 12px 14px; border-radius: 10px;
            border: 1px solid var(--warn, #c98a1b); background: color-mix(in srgb, var(--warn, #c98a1b) 10%, transparent); font-size: 14px; }
   [hidden] { display: none !important; }
@@ -121,7 +132,7 @@
 <main>
   <header>
     <h1>pano-gen</h1>
-    <span class="sub">로컬 360° 파노라마 · 2K 확인 후 8K</span>
+    <span class="sub">로컬 360° 파노라마·일반 이미지 · 초안 확인 → 이음새 보정 → 8K</span>
     <nav class="tabs" id="tabs">
       <button data-tab="gen" class="on">생성</button>
       <button data-tab="cmp">모델 비교</button>
@@ -154,44 +165,57 @@
   <div id="tab-gen">
   <ol class="steps" id="steps">
     <li data-s="prompt">1 프롬프트</li>
-    <li data-s="gen">2 2K 생성</li>
-    <li data-s="review">3 확인</li>
-    <li data-s="up">4 8K</li>
+    <li data-s="gen">2 초안 생성</li>
+    <li data-s="review">3 초안 확인</li>
+    <li data-s="seam" class="pano-only">4 이음새 보정</li>
+    <li data-s="up">5 8K</li>
   </ol>
 
   <!-- 1. 프롬프트 -->
   <section class="card" id="s-prompt">
-    <h2>프롬프트</h2>
+    <div class="row" style="margin:0 0 12px;align-items:center">
+      <h2 style="margin:0">프롬프트</h2>
+      <span class="spacer"></span>
+      <div class="seg" id="type" role="group" aria-label="이미지 종류">
+        <button type="button" data-type="pano" class="on">360° 파노라마</button>
+        <button type="button" data-type="flat">일반 이미지</button>
+      </div>
+    </div>
     <textarea id="prompt" placeholder="예: misty korean temple courtyard at dawn, wooden halls with curved tiled roofs, stone lanterns, pine trees"></textarea>
-    <div class="hint">영어 권장 · 모델별 파노라마 트리거 문구가 자동으로 앞에 붙습니다 · 이미지를 첨부하면 그 이미지를 프롬프트대로 고쳐 360° 로 만듭니다</div>
+    <div class="hint" id="prompt-hint"></div>
     <div class="attach" id="attach">
-      <input type="file" id="file" accept="image/jpeg,image/png,image/webp" hidden>
+      <input type="file" id="file" accept="image/jpeg,image/png,image/webp" multiple hidden>
       <button id="btn-attach">이미지 첨부</button>
-      <span class="sub" id="attach-hint">또는 여기로 끌어다 놓기 (JPG·PNG·WEBP)</span>
-      <img id="attach-img" hidden alt="첨부 이미지">
+      <span class="sub" id="attach-hint">또는 여기로 끌어다 놓기 (최대 3장 · JPG·PNG·WEBP)</span>
+      <div class="thumbs" id="thumbs"></div>
       <div class="info" id="attach-info" hidden>
         <span id="attach-kind"></span>
+        <span class="note" id="attach-note"></span>
         <label class="chk" style="padding:0">원본 변경 정도 <input type="range" id="strength" min="0" max="1" step="0.05"> <b id="strength-v"></b></label>
         <label class="chk" style="padding:0" id="fov-wrap">사진 가로 화각 <input type="number" id="fov" min="30" max="170" value="90" style="width:70px"> °</label>
       </div>
       <span class="spacer"></span>
-      <button id="btn-detach" hidden>첨부 빼기</button>
+      <button id="btn-detach" hidden>모두 빼기</button>
     </div>
     <div class="row">
       <label class="f">장수 <input id="count" type="number" min="1" max="8" value="1"></label>
       <label class="f">시드 (비우면 무작위) <input id="seed" type="number" min="0" placeholder="무작위"></label>
       <label class="f">steps (비우면 설정값) <input id="steps-in" type="number" min="1" max="60" placeholder="설정값"></label>
+      <label class="f" id="aspect-wrap" hidden>비율 <select id="aspect">
+        <option value="auto">자동 (첨부 비율 · 없으면 1:1)</option><option>1:1</option><option>4:3</option><option>3:4</option>
+        <option>3:2</option><option>2:3</option><option>16:9</option><option>9:16</option></select></label>
       <label class="f">모델 <select id="backend"></select></label>
       <label class="chk" id="fast-wrap" hidden><input type="checkbox" id="fast"> 빠르게 (Lightning 8 step)</label>
       <span class="spacer"></span>
-      <button class="primary" id="btn-gen">2K 생성</button>
+      <button class="primary" id="btn-gen">초안 생성</button>
     </div>
     <div class="msg err" id="gen-err" hidden></div>
   </section>
 
   <!-- 3. 확인 -->
   <section class="card" id="s-review" hidden>
-    <h2>2K 결과 확인</h2>
+    <h2 id="review-title">결과 확인</h2>
+    <div class="hint" id="review-hint" style="margin:-6px 0 12px"></div>
     <div class="prompt-shown" id="review-prompt"></div>
     <div class="input-ref" id="review-input" hidden></div>
     <div class="grid" id="grid"></div>
@@ -201,6 +225,7 @@
       <span class="spacer"></span>
       <label class="chk" id="refine-wrap"><input type="checkbox" id="refine"> 디테일 강화 (느림)</label>
       <span class="sub" id="sel-count"></span>
+      <button id="btn-seam" disabled>선택 이음새 보정</button>
       <button class="primary" id="btn-up" disabled>선택한 시드 8K 생성</button>
     </div>
     <div class="msg err" id="review-err" hidden></div>
@@ -263,18 +288,24 @@ const api = async (path, body) => {
 };
 const PHASE = {
   starting: "시작 중", encoding: "1/3 텍스트 인코딩 (CPU)", loading: "2/3 모델 적재",
-  refining: "디테일 강화 (타일)", generating: "3/3 이미지 생성", seam: "이음새 인페인팅", postprocess: "이음새 검사·저장", upscaling: "8K 업스케일",
+  refining: "디테일 강화 (타일)", generating: "3/3 이미지 생성", seam: "이음새 보정 (인페인팅)", postprocess: "검사·저장", upscaling: "업스케일",
 };
 const fmt = (s) => { s = Math.max(0, s | 0); const m = (s / 60) | 0; return m ? `${m}분 ${s % 60}초` : `${s}초`; };
 
-let current = { name: null, prompt: "" };   // 지금 보고 있는 작업 폴더
+let current = { name: null, prompt: "", type: "pano" };   // 지금 보고 있는 작업 폴더
 let selected = new Set();
 let polling = null;
+let genType = "pano";        // 새로 만들 종류: pano(360°) | flat(일반 이미지)
 
-function setStep(s) {
-  const order = ["prompt", "gen", "review", "up"];
+function setStep(s, type = current.type) {
+  const flat = type === "flat";
+  const order = ["prompt", "gen", "review", "seam", "up"];
+  const label = { gen: flat ? "생성" : "초안 생성", review: flat ? "확인" : "초안 확인", up: flat ? "고해상도" : "8K" };
+  let n = 0;
   document.querySelectorAll("#steps li").forEach((li) => {
     const i = order.indexOf(li.dataset.s), k = order.indexOf(s);
+    li.hidden = flat && li.dataset.s === "seam";
+    if (!li.hidden) li.textContent = `${++n} ${label[li.dataset.s] || li.textContent.replace(/^\d+ /, "")}`;
     li.classList.toggle("on", i === k); li.classList.toggle("done", i < k);
   });
 }
@@ -284,20 +315,21 @@ function show(which) {
   $("s-review").hidden = which !== "review";
 }
 const GEN_KINDS = new Set(["generate", "upscale"]);
-const TITLE = { generate: "2K 생성", upscale: "8K 업스케일", download: "모델 받기", bench: "모델 비교 벤치" };
+const TITLE = { generate: "초안 생성", upscale: "업스케일", seam: "이음새 보정", download: "모델 받기", bench: "모델 비교 벤치" };
 
 // ---------- 1. 생성 ----------
 async function generate(prompt) {
   $("gen-err").hidden = true;
   try {
     const j = await api("/api/generate", {
-      prompt, count: +$("count").value || 1,
+      prompt, count: +$("count").value || 1, type: genType, aspect: $("aspect").value,
       seed: $("seed").value === "" ? null : +$("seed").value,
       steps: $("steps-in").value === "" ? null : +$("steps-in").value,
       backend: $("backend").value, fast: !$("fast-wrap").hidden && $("fast").checked,
-      ...(attached ? { image: attached.id, strength: +$("strength").value, fov: attached.panorama ? null : +$("fov").value } : {}),
+      ...(attached.length ? { images: attached.map((a) => a.id), strength: +$("strength").value,
+                              fov: genType === "pano" && attached.some((a) => !a.panorama) ? +$("fov").value : null } : {}),
     });
-    current = { name: j.name, prompt };
+    current = { name: j.name, prompt, type: genType };
     startPolling();
   } catch (e) { $("gen-err").textContent = e.message; $("gen-err").hidden = false; show("prompt"); setStep("prompt"); }
 }
@@ -307,43 +339,83 @@ $("btn-gen").onclick = () => {
   generate(p);
 };
 
-// ---------- 이미지 첨부 ----------
-let attached = null;   // {id, url, width, height, panorama}
+// ---------- 종류 (360° / 일반) ----------
+function setType(t) {
+  genType = t;
+  document.querySelectorAll("#type button").forEach((b) => b.classList.toggle("on", b.dataset.type === t));
+  const flat = t === "flat";
+  $("aspect-wrap").hidden = !flat;
+  $("btn-gen").textContent = flat ? "생성" : "초안 생성";
+  $("prompt-hint").textContent = flat
+    ? "영어 권장 · 파노라마 LoRA 없이 같은 모델로 일반 이미지를 만듭니다 · 이미지를 첨부하면 그 이미지를 프롬프트대로 고칩니다"
+    : "영어 권장 · 모델별 파노라마 트리거 문구가 자동으로 앞에 붙습니다 · 이음새 보정 전 초안을 먼저 보여 드립니다";
+  strengthTouched = false;
+  renderAttach(); setStep("prompt", t);
+}
+document.querySelectorAll("#type button").forEach((b) => b.onclick = () => setType(b.dataset.type));
+
+// ---------- 이미지 첨부 (최대 3장) ----------
+const MAX_IMG = 3;
+let attached = [];   // [{id, url, width, height, panorama}]
+let strengthTouched = false;
+function backendKind() { return BACKENDS.find((b) => b.name === $("backend").value)?.kind; }
+function attachSummary() {
+  const n = attached.length, kind = backendKind(), flat = genType === "flat";
+  const panos = attached.filter((a) => a.panorama).length;
+  if (kind === "klein") return [`${n}장 모두 참조 이미지로 사용 (klein)`, flat ? "" : "프롬프트대로 고친 360° 파노라마로 변환합니다"];
+  if (flat) return [n === 1 ? "이 이미지를 바탕으로 프롬프트대로 수정" : `첫 장을 바탕으로 수정`,
+                    n > 1 ? `추가 ${n - 1}장은 이 모델에서 쓰지 않습니다 — 여러 장을 함께 참조하려면 klein360` : ""];
+  if (panos) return [`2:1 파노라마를 프롬프트대로 수정`,
+                     n > 1 ? `파노라마를 고칠 때는 1장만 씁니다 (추가 ${n - 1}장 제외) — 여러 장 참조는 klein360` : ""];
+  const where = n === 1 ? "정면" : n === 2 ? "정면·뒤(0°·180°)" : "0°·120°·240° 방향";
+  return [`사진 ${n}장 → ${where}에 두고 나머지를 360° 로 확장`, n > 1 ? `여러 장이면 겹치지 않게 화각을 ${Math.round(360 / n - 4)}° 이하로 줄입니다` : ""];
+}
 function renderAttach() {
-  const on = !!attached;
-  $("attach-img").hidden = $("attach-info").hidden = $("btn-detach").hidden = !on;
-  $("attach-hint").hidden = on;
-  $("btn-attach").textContent = on ? "다른 이미지" : "이미지 첨부";
-  if (!on) return;
-  $("attach-img").src = attached.url;
-  $("attach-kind").textContent = attached.panorama
-    ? `2:1 파노라마 (${attached.width}×${attached.height}) → 프롬프트대로 수정`
-    : `일반 사진 (${attached.width}×${attached.height}) → 정면에 두고 360° 로 확장`;
-  $("fov-wrap").hidden = attached.panorama;
-  $("strength").value = attached.panorama ? 0.6 : 0.3;
+  const n = attached.length;
+  $("attach-info").hidden = $("btn-detach").hidden = !n;
+  $("attach-hint").hidden = n > 0;
+  $("btn-attach").hidden = n >= MAX_IMG;
+  $("btn-attach").textContent = n ? `이미지 추가 (${n}/${MAX_IMG})` : "이미지 첨부";
+  const box = $("thumbs"); box.innerHTML = "";
+  attached.forEach((a, i) => {
+    const el = document.createElement("div"); el.className = "thumb";
+    el.innerHTML = `<img alt="첨부 ${i + 1}"><span class="n">${i + 1}</span><button type="button" aria-label="${i + 1}번 빼기">×</button>`;
+    el.querySelector("img").src = a.url;
+    el.querySelector("img").title = `${a.width}×${a.height}${a.panorama ? " · 2:1 파노라마" : ""}`;
+    el.querySelector("button").onclick = () => { attached.splice(i, 1); renderAttach(); };
+    box.appendChild(el);
+  });
+  if (!n) { strengthTouched = false; return; }
+  const [kind, note] = attachSummary();
+  $("attach-kind").textContent = kind;
+  $("attach-note").textContent = note;
+  const photos = attached.some((a) => !a.panorama) && !attached.some((a) => a.panorama);
+  $("fov-wrap").hidden = genType === "flat" || !photos || backendKind() === "klein";
+  if (!strengthTouched) $("strength").value = genType === "pano" && photos && backendKind() !== "klein" ? 0.3 : 0.6;
   $("strength-v").textContent = $("strength").value;
 }
-$("strength").oninput = () => { $("strength-v").textContent = $("strength").value; };
-async function upload(file) {
+$("strength").oninput = () => { strengthTouched = true; $("strength-v").textContent = $("strength").value; };
+async function upload(files) {
   $("gen-err").hidden = true;
-  if (!file || !/^image\/(jpeg|png|webp)$/.test(file.type)) {
-    $("gen-err").textContent = "JPG·PNG·WEBP 이미지만 첨부할 수 있습니다."; $("gen-err").hidden = false; return;
-  }
+  const list = [...files];
   try {
-    const r = await fetch("/api/upload", { method: "POST", body: file });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error);
-    attached = j; renderAttach();
+    if (attached.length + list.length > MAX_IMG) throw new Error(`이미지는 최대 ${MAX_IMG}장까지 첨부할 수 있습니다.`);
+    for (const file of list) {
+      if (!file || !/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error("JPG·PNG·WEBP 이미지만 첨부할 수 있습니다.");
+      const r = await fetch("/api/upload", { method: "POST", body: file });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error);
+      attached.push(j); renderAttach();
+    }
   } catch (e) { $("gen-err").textContent = e.message; $("gen-err").hidden = false; }
 }
 $("btn-attach").onclick = () => $("file").click();
-$("file").onchange = () => { upload($("file").files[0]); $("file").value = ""; };
-$("btn-detach").onclick = () => { attached = null; renderAttach(); };
+$("file").onchange = () => { upload($("file").files); $("file").value = ""; };
+$("btn-detach").onclick = () => { attached = []; renderAttach(); };
 const zone = $("s-prompt");
 zone.addEventListener("dragover", (e) => { e.preventDefault(); $("attach").classList.add("drag"); });
 zone.addEventListener("dragleave", () => $("attach").classList.remove("drag"));
-zone.addEventListener("drop", (e) => { e.preventDefault(); $("attach").classList.remove("drag"); upload(e.dataTransfer.files[0]); });
-renderAttach();
+zone.addEventListener("drop", (e) => { e.preventDefault(); $("attach").classList.remove("drag"); upload(e.dataTransfer.files); });
 
 // ---------- 2. 진행도 ----------
 function startPolling(kind = "generate") {
@@ -364,8 +436,8 @@ async function poll() {
     $("pause-text").textContent = `지금 여유 ${j.free_gb ?? "?"}GB · ${j.resume_free_gb}GB 가 되면 자동으로 이어집니다 (약 ${need.toFixed(1)}GB 더 필요)`;
     $("btn-resume").disabled = (j.free_gb ?? 0) < j.min_free_gb;
   }
-  if (gen) { current.name = j.name; setStep(j.kind === "upscale" ? "up" : "gen"); }
-  $("prog-title").textContent = (TITLE[j.kind] || j.kind) + (j.kind === "download" ? ` — ${j.name}` : "");
+  if (gen) { current.name = j.name; setStep(j.label === "seam" ? "seam" : j.kind === "upscale" ? "up" : "gen"); }
+  $("prog-title").textContent = (TITLE[j.label] || TITLE[j.kind] || j.kind) + (j.kind === "download" ? ` — ${j.name}` : "");
   $("phase").textContent = (j.kind === "bench" && j.sub ? `${j.sub.replace(/^bench_\d+_\d+_/, "")} · ` : "")
     + (j.phase === "downloading" ? (j.log[j.log.length - 1] || "받는 중") : (PHASE[j.phase] || j.phase));
   const m = $("meter");
@@ -418,55 +490,89 @@ $("btn-resume").onclick = async () => {
 };
 
 // ---------- 3. 확인 ----------
+let reviewItems = [];
 async function openReview(name) {
-  const items = await api(`/api/results?name=${encodeURIComponent(name)}`).catch(() => []);
+  const items = reviewItems = await api(`/api/results?name=${encodeURIComponent(name)}`).catch(() => []);
   current.name = name;
   if (items[0]?.prompt) current.prompt = items[0].prompt;
+  current.type = items[0]?.type || "pano";
+  const flat = current.type === "flat", pending = items.some((i) => i.seam_pending);
   selected = new Set();
   $("review-prompt").textContent = current.prompt ? `“${current.prompt}”` : "";
+  $("review-title").textContent = flat ? "결과 확인" : pending ? "초안 확인 (이음새 보정 전)" : "결과 확인";
+  $("review-hint").textContent = flat ? "마음에 드는 이미지를 골라 고해상도(4배)로 만듭니다. 고칠 점이 있으면 프롬프트를 수정해 다시 생성하세요."
+    : pending ? "이음새를 보정하기 전 초안입니다. 구도·내용이 마음에 들지 않으면 지금 프롬프트를 고쳐 다시 만드세요. 고른 시드만 이음새 보정 → 8K 로 진행합니다 (360° 보기의 '이음새 보기'로 0°/360° 경계를 확인)."
+    : "이음새 보정이 끝난 결과입니다. 고른 시드를 8K 로 만듭니다.";
   const ri = $("review-input"), im0 = items[0];
-  ri.hidden = !im0?.input;
-  if (im0?.input) {
+  const inputs = im0?.inputs?.length ? im0.inputs : im0?.input ? [im0.input] : [];
+  ri.hidden = !inputs.length;
+  if (inputs.length) {
     const m = im0.input_meta || {};
-    ri.innerHTML = `<img src="${im0.input}" alt="첨부 원본"><span>첨부 원본 · ${m.mode === "img2img" ? "파노라마 수정" : `사진 → 360° 확장 (화각 ${m.fov ?? "-"}°)`} · 변경 정도 ${m.strength ?? "-"}</span>`;
-    ri.querySelector("img").onclick = () => window.open(im0.input, "_blank");
+    const how = m.mode === "img2img" ? (flat ? "이미지 수정" : "파노라마 수정")
+      : `사진 ${inputs.length}장 → 360° 확장 (화각 ${m.fov ? Math.round(m.fov) : "-"}°${m.yaws?.length > 1 ? ", " + m.yaws.map((y) => Math.round(y) + "°").join("·") : ""})`;
+    ri.innerHTML = inputs.map((u, i) => `<img src="${u}" alt="첨부 ${i + 1}" data-u="${u}">`).join("")
+      + `<span>첨부 원본 ${inputs.length}장 · ${how} · 변경 정도 ${m.strength ?? "-"}${m.unused ? ` · ${m.unused}장 미사용` : ""}</span>`;
+    ri.querySelectorAll("img").forEach((im) => im.onclick = () => window.open(im.dataset.u, "_blank"));
   }
   const g = $("grid"); g.innerHTML = "";
   for (const it of items) {
     const card = document.createElement("div");
-    card.className = "pano";
-    const seam = it.seam ? `<span class="tag ${it.seam === "양호" ? "ok" : "warn"}">이음새 ${it.seam}</span>` : "";
-    const secs = it.seconds ? `<span class="tag">${fmt(it.seconds)}</span>` : "";
-    const model = `<span class="tag">${it.backend}${it.fast ? " fast" : ""}${it.refined ? " · 디테일" : ""}</span>`;
-    const big = it.img8k ? `<span class="tag ok">8K 완료</span> <a href="${it.img8k}" download>8K 받기</a> <a href="#" data-v="${it.img8k}">8K 360°</a>` : "";
+    card.className = "pano" + (flat ? " flat" : "");
+    const tags = [];
+    tags.push(`<span class="tag">${esc(it.backend)}${it.fast ? " fast" : ""}${it.refined ? " · 디테일" : ""}</span>`);
+    if (flat && it.size) tags.push(`<span class="tag">${it.size[0]}×${it.size[1]}</span>`);
+    if (!flat) {
+      if (it.seam_pending) tags.push(`<span class="tag warn">이음새 보정 전</span>`);
+      else tags.push(`<span class="tag ok">이음새 보정됨${it.inpainted ? " (인페인팅)" : ""}</span>`);
+      if (it.seam && it.seam_pending) tags.push(`<span class="tag ${it.seam === "양호" ? "ok" : "warn"}">경계 ${esc(it.seam)}</span>`);
+    }
+    if (it.seconds) tags.push(`<span class="tag">${fmt(it.seconds)}</span>`);
+    const view = flat ? `<a href="${it.img2k}" target="_blank" rel="noopener">크게 보기</a>` : `<a href="#" data-v="${it.img2k}">360° 보기</a>`;
+    const before = !flat && it.raw && !it.seam_pending ? `<a href="#" data-v="${it.raw}">보정 전</a>` : "";
+    const done = flat ? "고해상도 완료" : "8K 완료";
+    const big = it.img8k ? `<span class="tag ok">${done}</span> <a href="${it.img8k}" download>받기</a>${flat ? "" : ` <a href="#" data-v="${it.img8k}">8K 360°</a>`}` : "";
     card.innerHTML = `<img src="${it.img2k}" alt="seed ${it.seed}" loading="lazy">
       <div class="meta"><label style="display:flex;gap:6px;align-items:center"><input type="checkbox">
-      <b>seed ${it.seed ?? it.stem}</b></label>${model}${seam}${secs}<span class="spacer"></span>
-      <a href="#" data-v="${it.img2k}">360° 보기</a>${big}</div>`;
+      <b>seed ${it.seed ?? esc(it.stem)}</b></label>${tags.join("")}<span class="spacer"></span>
+      ${view}${before}${big}</div>`;
     const cb = card.querySelector("input");
     cb.onchange = () => { cb.checked ? selected.add(it.seed) : selected.delete(it.seed); card.classList.toggle("sel", cb.checked); updateSel(); };
-    card.querySelector("img").onclick = () => openViewer(it.img2k);
+    card.querySelector("img").onclick = () => flat ? window.open(it.img2k, "_blank") : openViewer(it.img2k);
     card.querySelectorAll("a[data-v]").forEach((a) => a.onclick = (e) => { e.preventDefault(); openViewer(a.dataset.v); });
     g.appendChild(card);
   }
   if (!items.length) g.innerHTML = `<span class="sub">결과 이미지가 없습니다.</span>`;
   updateSel();
   const be = BACKENDS.find((b) => b.name === items[0]?.backend);
-  $("refine-wrap").hidden = !(be ? be.refine : true);
-  show("review"); setStep(items.some((i) => i.img8k) ? "up" : "review");
+  $("refine-wrap").hidden = flat || !(be ? be.refine : true);
+  $("btn-again").textContent = flat ? "같은 프롬프트로 새 시드" : "같은 프롬프트로 새 초안";
+  show("review");
+  setStep(items.some((i) => i.img8k) ? "up" : !flat && !pending ? "seam" : "review");
 }
 function updateSel() {
+  const flat = current.type === "flat";
+  const sel = reviewItems.filter((i) => selected.has(i.seed));
+  const pend = sel.filter((i) => i.seam_pending).length;
+  $("btn-seam").hidden = flat || !reviewItems.some((i) => i.seam_pending);
+  $("btn-seam").disabled = !pend;
+  $("btn-seam").textContent = pend ? `선택 ${pend}장 이음새 보정` : "선택 이음새 보정";
   $("btn-up").disabled = selected.size === 0;
-  $("sel-count").textContent = selected.size ? `${selected.size}개 선택` : "마음에 드는 시드를 고르세요";
+  $("btn-up").textContent = flat ? "선택 이미지 고해상도 (4배)" : pend ? "선택 시드 8K (이음새 보정 포함)" : "선택 시드 8K 생성";
+  $("sel-count").textContent = selected.size ? `${selected.size}개 선택` : flat ? "마음에 드는 이미지를 고르세요" : "마음에 드는 시드를 고르세요";
 }
-$("btn-up").onclick = async () => {
+async function runUpscale(seamOnly) {
   $("review-err").hidden = true;
-  try { await api("/api/upscale", { name: current.name, seeds: [...selected], refine: !$("refine-wrap").hidden && $("refine").checked }); startPolling("upscale"); }
-  catch (e) { $("review-err").textContent = e.message; $("review-err").hidden = false; }
-};
-function resetToPrompt() { show("prompt"); setStep("prompt"); }
+  try {
+    await api("/api/upscale", { name: current.name, seeds: [...selected], seam_only: seamOnly,
+                                refine: !seamOnly && !$("refine-wrap").hidden && $("refine").checked });
+    startPolling("upscale");
+  } catch (e) { $("review-err").textContent = e.message; $("review-err").hidden = false; }
+}
+$("btn-seam").onclick = () => runUpscale(true);
+$("btn-up").onclick = () => runUpscale(false);
+function resetToPrompt() { show("prompt"); setType(current.type || genType); }
 $("btn-edit").onclick = () => { $("prompt").value = current.prompt; resetToPrompt(); $("prompt").focus(); };
-$("btn-again").onclick = () => { $("prompt").value = current.prompt; $("seed").value = ""; generate(current.prompt); };
+$("btn-again").onclick = () => { $("prompt").value = current.prompt; $("seed").value = ""; genType = current.type || genType; setType(genType); generate(current.prompt); };
 
 // ---------- 이전 작업 ----------
 async function loadSessions() {
@@ -474,7 +580,7 @@ async function loadSessions() {
   const box = $("sessions"); box.innerHTML = list.length ? "" : `<span class="sub">없음</span>`;
   for (const s of list) {
     const b = document.createElement("button");
-    b.innerHTML = `<span class="t">${s.mtime}</span><span class="t">${s.count}장</span><span class="tag">${s.backend}</span><span class="p"></span>`;
+    b.innerHTML = `<span class="t">${s.mtime}</span><span class="t">${s.count}장</span><span class="tag">${s.type === "flat" ? "일반" : "360°"}</span><span class="tag">${esc(s.backend)}</span><span class="p"></span>`;
     b.querySelector(".p").textContent = s.prompt || s.name;
     b.onclick = () => { if (!polling) { current.prompt = s.prompt; openReview(s.name); window.scrollTo({ top: 0, behavior: "smooth" }); } };
     box.appendChild(b);
@@ -552,6 +658,7 @@ async function loadModels() {
   sel.value = prev && BACKENDS.some((b) => b.name === prev) ? prev : (BACKENDS.find((b) => b.default) || BACKENDS[0])?.name;
   sel.onchange = () => {
     const b = BACKENDS.find((x) => x.name === sel.value);
+    renderAttach();
     $("fast-wrap").hidden = !b?.fast;
     $("fast").disabled = !b?.fast_ready;
     $("fast-wrap").title = b?.fast_ready ? "" : "모델 관리 탭에서 Lightning 포함으로 받으세요";
@@ -663,6 +770,7 @@ async function openCompare(tag, quiet = false) {
 // ---------- 시작: 진행 중인 작업이 있으면 이어서 표시 ----------
 { let t = location.hash.slice(1); try { t = t || localStorage.getItem("panogen-tab"); } catch {}
   if (["cmp", "models"].includes(t)) setTab(t); }
+setType("pano");
 loadSessions();
 api("/api/job").then((j) => {
   if (j && (j.state === "running" || j.state === "paused")) { if (!GEN_KINDS.has(j.kind)) { show("prompt"); setStep("prompt"); if (j.kind === "bench") { setTab("cmp"); cmpTag = j.name; } } startPolling(j.kind); }

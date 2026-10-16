@@ -2,7 +2,7 @@
 
 1) 텍스트 인코더만 올려 모든 프롬프트를 임베딩 → 해제
 2) 트랜스포머를 프로필에 맞게 적재(bf16/fp8/nf4/gguf) + 파노라마 LoRA (+ 선택: 속도 LoRA)
-3) 임베딩으로 2048×1024 생성
+3) 임베딩으로 2048×1024 생성 (일반 이미지 pano=False 면 파노라마 LoRA 없이 지정 크기)
 
 백엔드별 차이(임베딩 종류, CFG 방식)는 _encode_one / _call_kwargs 에만 있다. 백엔드 목록은 backends.py.
 """
@@ -38,7 +38,7 @@ def build_prompt(prompt: str, prefix: str) -> str:
 
 class Engine:
     def __init__(self, root: Path, cfg: dict, profile: Profile, bf16: bool = True, log: Log = print,
-                 backend: str | None = None, fast: bool = False):
+                 backend: str | None = None, fast: bool = False, pano: bool = True):
         import torch
 
         self.torch = torch
@@ -47,6 +47,7 @@ class Engine:
         self.profile = profile
         self.log = log
         self.b = resolve_backend(cfg, backend)
+        self.pano = pano          # False: 일반 이미지 — 파노라마 LoRA·순환 패딩 없이 같은 베이스 모델
         self.fast = fast and bool(self.b.get("speed_lora"))
         self.sampling = sampling(self.b, cfg.get("generate", {}), self.fast)
         self.dtype = torch.bfloat16 if (bf16 or profile.device == "mps") else torch.float16
@@ -54,11 +55,14 @@ class Engine:
         self.pipe = None
 
     def _pipeline_class(self):
+        import diffusers
+
         if self.b["kind"] == "dit360":
+            if not self.pano:      # 일반 이미지: 순환 패딩 없는 FLUX.1-dev 그대로
+                return diffusers.FluxPipeline
             from panogen.dit360 import load_pipeline_class
 
             return load_pipeline_class(self.root)
-        import diffusers
 
         return getattr(diffusers, CLASSES[self.b["kind"]][0])
 
@@ -135,7 +139,7 @@ class Engine:
         b = self.b
         names, weights = [], []
         for key, scale, adapter in (("lora", b["lora_scale"], "pano"), ("speed_lora", 1.0, "speed")):
-            if not b.get(key) or (adapter == "speed" and not self.fast):
+            if not b.get(key) or (adapter == "speed" and not self.fast) or (adapter == "pano" and not self.pano):
                 continue
             kw = {"weight_name": b[f"{key}_file"]} if b.get(f"{key}_file") else {}
             pipe.load_lora_weights(b[key], adapter_name=adapter, **kw)
@@ -191,17 +195,18 @@ class Engine:
             kw["max_sequence_length"] = self.max_len
         return kw
 
-    def generate(self, emb: dict, seed: int, init=None):
-        """init: imagein.InitImage — 첨부 이미지를 프롬프트대로 고쳐 파노라마로 (None 이면 텍스트만)."""
+    def generate(self, emb: dict, seed: int, init=None, size: tuple[int, int] | None = None):
+        """init: imagein.InitImage — 첨부 이미지를 프롬프트대로 고쳐서 (None 이면 텍스트만).
+        size: (가로, 세로). 없으면 설정의 파노라마 크기(2048×1024)."""
         t = self.torch
         g = self.cfg["generate"]
         pipe = self.load()
         dev = self.profile.device
-        w, h = int(g["width"]), int(g["height"])
+        w, h = size or (int(g["width"]), int(g["height"]))
         kw = dict(**{k: v.to(dev) for k, v in emb.items()}, width=w, height=h,
                   num_inference_steps=self.sampling["steps"], **self._call_kwargs())
         gen = lambda s: t.Generator("cpu").manual_seed(s)
-        self.circular = self.b["kind"] == "dit360" and init is None   # DiT360 순환 패딩은 텍스트 생성에만
+        self.circular = self.b["kind"] == "dit360" and self.pano and init is None   # DiT360 순환 패딩은 360 텍스트 생성에만
         with t.inference_mode():
             if init is None:
                 img = self._run(pipe, **kw, generator=gen(seed))
@@ -243,15 +248,19 @@ class Engine:
         from PIL import Image
 
         kind = self.b["kind"]
-        if kind == "klein":    # FLUX.2 klein: 참조 이미지 편집 ("Convert to an Equirectangular 360 panorama")
-            self.log("      이미지 입력: 참조 이미지 편집 (klein)")
-            return self._run(self.pipe, image=[Image.fromarray(init.source)], **kw, generator=gen(seed))
+        if kind == "klein":    # FLUX.2 klein: 첨부 전부를 참조 이미지로 편집 (360 은 "Convert to an Equirectangular …")
+            refs = [Image.fromarray(s) for s in init.sources]
+            self.log(f"      이미지 입력: 참조 이미지 {len(refs)}장 편집 (klein)")
+            return self._run(self.pipe, image=refs, **kw, generator=gen(seed))
+        if init.unused:
+            self.log(f"      (추가 첨부 {init.unused}장은 이 모드에서 쓰지 않음 — 여러 장 참조는 klein360)")
         if init.mode == "img2img":
-            self.log(f"      이미지 입력: 파노라마 수정 (strength {init.strength})")
+            self.log(f"      이미지 입력: {'파노라마' if self.pano else '이미지'} 수정 (strength {init.strength})")
             return self._run(self.sibling(IMG2IMG[kind]), image=Image.fromarray(init.image), strength=init.strength,
                              **kw, generator=gen(seed))
         # 일반 사진: 정면에 투영된 사진 밖을 새로 그린 뒤, 사진 영역은 원본으로 다시 합성
-        self.log(f"      이미지 입력: 사진 → 360° 확장 (화각 {init.fov:.0f}°)")
+        where = "정면" if len(init.yaws or [0]) == 1 else "·".join(f"{y:.0f}°" for y in init.yaws)
+        self.log(f"      이미지 입력: 사진 {len(init.yaws or [0])}장 → 360° 확장 (화각 {init.fov:.0f}°, 배치 {where})")
         out = self._run(self.sibling(OUTPAINT[kind]), image=Image.fromarray(init.image),
                         mask_image=Image.fromarray(init.mask), strength=1.0, **kw, generator=gen(seed))
         soft = _feather(init.mask, 6)[..., None]

@@ -87,7 +87,7 @@ panogen ui            # http://127.0.0.1:8370/  (--port 로 변경)
 ```
 | 탭 | 하는 일 |
 |---|---|
-| **생성** | 프롬프트·모델(·빠르게) 선택 → 진행도(단계·step·남은 시간·로그) → 2K 확인(평면 + 360° 미리보기) → 고른 시드만 8K (디테일 강화 선택) 또는 프롬프트 수정 / 새 시드 |
+| **생성** | 종류(360° 파노라마 / 일반 이미지)·프롬프트·첨부(최대 3장)·모델 선택 → 진행도 → **초안 확인**(이음새 보정 전, 평면 + 360° 미리보기) → 고른 시드만 **이음새 보정** → 8K (디테일 강화 선택), 또는 프롬프트 수정 / 새 초안. 일반 이미지는 확인 → 고해상도(4배) |
 | **모델 비교** | 준비된 모델(·fast)을 골라 고정 프롬프트 N개 × 시드로 벤치 실행 → 프롬프트×모델 표로 2K·시간·메모리·이음새 비교, 칸을 누르면 360° |
 | **모델 관리** | 모델별 받은 것/없는 것, 디스크 여유, 받기 버튼(Lightning 포함 선택), HF 동의 필요 여부 |
 
@@ -121,8 +121,25 @@ panogen upscale outputs/castle/seed100_2k.png other.png
 - FLUX 의 T5 인코더는 영어를 가장 잘 이해하므로 영어 프롬프트를 권장합니다
 - 같은 시드·설정이면 같은 결과가 나옵니다. 설정과 소요 시간은 `seedN.json` 에 기록됩니다
 
-### 이미지 + 프롬프트
-첨부 이미지를 프롬프트대로 고쳐 360° 파노라마로 만듭니다. 웹 UI 에서는 프롬프트 칸 아래 "이미지 첨부"(끌어다 놓기 가능).
+### 360° 초안 → 이음새 보정
+웹 UI 의 360° 생성은 이음새를 보정하기 전 **초안**(`seedN_raw.png`)에서 멈춥니다. 구도가 마음에 들지 않으면 이 단계에서 프롬프트를 고치고,
+고른 시드만 이음새 보정(`seedN_2k.png`, 초안은 비교용으로 남음) → 8K 로 갑니다. 8K 를 바로 고르면 이음새 보정부터 합니다.
+```bash
+panogen generate -p "..." --seam-later -c 3 -n draft          # 초안만 (seedN_raw.png)
+panogen upscale outputs/draft --seed 2 --seam-only            # 이음새만 보정 (직접 고른 것은 생성형 인페인팅)
+panogen upscale outputs/draft --seed 2                        # 이음새 보정(아직이면) → 8K
+```
+
+### 일반 이미지
+`--type flat` 은 파노라마 LoRA·트리거 문구 없이 같은 베이스 모델로 일반 이미지를 만듭니다. 이음새 단계가 없고, 업스케일은 `upscale.flat_scale`(기본 4)배입니다.
+```bash
+panogen generate -p "a stone lantern in the rain" --type flat --aspect 16:9   # 1:1 4:3 3:4 3:2 2:3 16:9 9:16, auto = 첨부 비율
+panogen generate -p "same scene at night" --type flat --image photo.jpg       # 첨부를 프롬프트대로 수정
+```
+크기는 약 1MP(`generate.flat_base` = 1:1 한 변, 기본 1024)입니다.
+
+### 이미지 + 프롬프트 (최대 3장)
+첨부 이미지를 프롬프트대로 고칩니다. 웹 UI 에서는 프롬프트 칸 아래 "이미지 첨부"(끌어다 놓기, 여러 장 선택 가능). 명령줄은 `--image` 를 최대 3번.
 ```bash
 panogen generate -p "same place in heavy snow at night" --image pano.jpg --strength 0.6       # 2:1 파노라마 → 수정
 panogen generate -p "a quiet korean temple courtyard" --image photo.jpg --fov 75 --strength 0.3   # 일반 사진 → 360° 확장
@@ -133,8 +150,14 @@ panogen generate -p "a quiet korean temple courtyard" --image photo.jpg --fov 75
 | 일반 사진 | 사진을 정면에 투영(`--fov` = 사진 가로 화각) → 사진 밖을 새로 생성 → 사진은 원본으로 다시 합성 → strength 만큼 전체 img2img | 기본 0.3. 0 이면 사진을 그대로 둔 채 주변만 생성 |
 
 - 폰 기본 카메라 화각은 약 70~80°, 광각은 100~120° 입니다. 화각이 실제와 다르면 정면이 늘어나거나 줄어 보입니다
-- 원본은 결과 폴더에 `input.*` 로 보관되고 `seedN.json` 의 `input` 에 방식이 기록됩니다
-- `klein360` 은 마스크 없이 참조 이미지를 넣어 "Convert to an Equirectangular 360 panorama" 로 변환합니다 (LoRA 의 변환 기능)
+- 원본은 결과 폴더에 `input1.*`, `input2.*` … 로 보관되고 `seedN.json` 의 `input` 에 방식이 기록됩니다
+
+여러 장을 첨부했을 때:
+
+| 모델 | 360° 파노라마 | 일반 이미지 |
+|---|---|---|
+| `klein360` | 전부 참조 이미지로 넣어 "Convert to an Equirectangular 360 panorama" 변환 | 전부 참조 이미지로 편집 |
+| `qwen360`·`dit360` | 사진들을 방향을 나눠 배치(2장 = 0°·180°, 3장 = 0°·120°·240°, 화각은 겹치지 않게 360/장수 이하) → 나머지 생성. 2:1 파노라마가 섞여 있으면 그 1장만 수정 | 첫 장을 목표 비율로 잘라 수정, 나머지는 쓰지 않음 |
 
 ### 이음새
 `qwen360` 은 추론 중 순환 패딩이 없어서, 이음새 비율이 기준(`seam.warn_ratio`) 이상이면 경계를 가운데로 옮겨
