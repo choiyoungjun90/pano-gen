@@ -1,0 +1,3 @@
+# Windows/Linux + NVIDIA. torch 는 CUDA 빌드를 먼저 설치 (setup_windows.ps1 참고)
+-r common.txt
+bitsandbytes>=0.45

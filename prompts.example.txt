@@ -1,0 +1,6 @@
+# 한 줄에 프롬프트 하나. # 으로 시작하면 무시.
+# 앞에 "This is a panorama. The image shows " 가 자동으로 붙음 (DiT360 학습 형식).
+# FLUX 텍스트 인코더(T5)는 영어를 가장 잘 이해하므로 영어 권장.
+a medieval castle on a hilltop surrounded by autumn forests, golden evening light
+a quiet library interior with tall wooden bookshelves, reading tables and warm lamps
+a mountain ridge above a sea of clouds at sunset, a small pavilion on a rock

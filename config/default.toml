@@ -1,0 +1,78 @@
+# 공용 기본값. 머신별 값은 config/local.toml 에 같은 키로 덮어쓰기.
+
+[model]
+backend = "dit360"      # dit360 | qwen360 | klein360  (아래 [backends.*] 참고, --backend 로 1회 변경)
+
+[generate]
+profile = "auto"        # auto | cuda-full | cuda-24g | cuda-12g | mps-16g
+width = 2048            # 세 백엔드 모두 2048×1024 로 학습됨 — 바꾸면 품질 저하
+height = 1024
+seed = -1               # -1 = 무작위
+# steps / guidance 를 여기 적으면 모든 백엔드에 강제 적용. 보통은 비워 두고 백엔드 기본값 사용
+upscale = false         # false: 2K 만 생성 → 확인 후 `panogen upscale <폴더> --seed N` / true: 생성 직후 8K 까지
+
+# ---------- 모델 백엔드 ----------
+# kind: dit360 | qwen | klein   gguf_*: mps-16g 프로필(맥)용 4bit 트랜스포머
+# speed_lora: --fast 일 때만 적용 (적은 step, CFG 끔)
+
+[backends.dit360]       # FLUX.1-dev 12B + DiT360 (추론 중 좌우 순환 패딩) — 비상업 라이선스
+kind = "dit360"
+base = "black-forest-labs/FLUX.1-dev"                       # HF 동의 + HF_TOKEN 필요
+lora = "Insta360-Research/DiT360-Panorama-Image-Generation"
+gguf_repo = "city96/FLUX.1-dev-gguf"
+gguf_file = "flux1-dev-Q4_K_S.gguf"
+prompt_prefix = "This is a panorama. The image shows "      # DiT360 학습 캡션 형식
+steps = 28
+guidance = 2.8          # DiT360 공식 예제값
+
+[backends.qwen360]      # Qwen-Image-2512 20B + Qwen 360 Diffusion v2 (2048×1024 ERP 3.5만 장 학습)
+kind = "qwen"
+base = "Qwen/Qwen-Image-2512"
+lora = "ProGamerGov/qwen-360-diffusion"
+lora_file = "qwen-360-diffusion-2512-int8-bf16-v2.safetensors"
+speed_lora = "lightx2v/Qwen-Image-2512-Lightning"
+speed_lora_file = "Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors"
+speed_steps = 8
+gguf_repo = "unsloth/Qwen-Image-2512-GGUF"
+gguf_file = "qwen-image-2512-Q4_K_S.gguf"
+prompt_prefix = "360 degree panorama with equirectangular projection, "
+steps = 25
+true_cfg = 4.0          # LoRA 작성자 예제값 (CFG 라 step 당 2회 계산)
+
+[backends.klein360]     # FLUX.2 [klein] base 9B + 360 panorama LoRA — HF 에서 별도 동의 필요
+kind = "klein"
+base = "black-forest-labs/FLUX.2-klein-base-9B"
+lora = "crafiq/flux-2-klein-9b-360-panorama-lora"
+lora_file = "flux-2-klein-9b-360-panorama-lora.safetensors"
+gguf_repo = "unsloth/FLUX.2-klein-base-9B-GGUF"
+gguf_file = "flux-2-klein-base-9b-Q4_K_S.gguf"
+prompt_prefix = "Equirectangular 360 panorama. "
+image_prompt_prefix = "Convert to an Equirectangular 360 panorama. "   # 이미지 입력 시 (LoRA 의 변환 트리거)
+steps = 28
+guidance = 4.0
+
+[seam]
+band = 48
+warn_ratio = 2.0
+inpaint = "auto"        # 생성형 이음새 보정 (qwen360): auto = 비율이 warn_ratio 이상일 때만 | always | off
+inpaint_strength = 0.5
+inpaint_width = 0.10    # 가운데 띠 폭 (이미지 너비 대비)
+
+[refine]                # panogen upscale --refine : 2K → 4K 생성형 디테일 강화 (dit360·qwen360)
+strength = 0.3          # 0.25~0.35 권장. 높을수록 디테일↑, 원본에서 벗어날 위험↑
+tile = 1024
+overlap = 128
+wrap_pad = 128
+
+[upscale]
+model_path = "models/upscale/RealESRGAN_x4plus.pth"   # scripts/download_upscaler.py 로 받기
+target_width = 8192
+tile = 512
+overlap = 32
+wrap_pad = 64
+half = true
+
+[output]
+dir = "outputs"
+jpeg_quality = 92
+save_png = true         # 8K PNG 는 장당 수십~100MB

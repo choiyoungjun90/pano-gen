@@ -1,0 +1,13 @@
+numpy>=1.26
+pillow>=10.0
+diffusers>=0.36
+transformers>=4.52
+accelerate>=1.0
+peft>=0.15
+sentencepiece
+protobuf
+safetensors
+huggingface_hub>=0.30
+spandrel>=0.4
+pytest>=8
+psutil

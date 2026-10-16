@@ -1,0 +1,38 @@
+# 생성 결과물 (용량 큼)
+outputs/*
+!outputs/.gitkeep
+
+# 모델 가중치 (라이선스·용량 문제로 커밋 금지)
+models/**/*.pth
+models/**/*.safetensors
+models/**/*.gguf
+models/**/*.pt
+
+# 외부 저장소 (scripts/fetch_dit360.py 가 고정 커밋으로 받음)
+third_party/*
+!third_party/.gitkeep
+
+# 머신별 설정·비밀값
+config/local.toml
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# OS / 에디터
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 로그·캐시
+*.log
+.coverage
+.ruff_cache/
+.mypy_cache/

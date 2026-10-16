@@ -1,0 +1,10 @@
+# 백엔드 비교용 고정 프롬프트 — panogen bench 가 사용 (한 줄에 하나, 영어)
+# 실외·실내·자연·야경·판타지·설경·하늘 비중이 큰 장면을 고르게 섞음
+misty korean temple courtyard at dawn, wooden halls with curved tiled roofs, stone lanterns, pine trees, soft morning light
+interior of a korean buddhist main hall, golden buddha statues, colorful dancheong painted beams, lotus lanterns hanging from the ceiling, warm candle light
+dense green bamboo forest with a narrow stone path, sunbeams through the leaves, light fog
+korean temple on a seaside cliff, waves crashing on dark rocks, blue sky with scattered clouds, a large stone pagoda
+neon lit seoul alley at night after rain, reflections on wet asphalt, small restaurants with glowing signs
+floating islands with waterfalls above a sea of clouds, ancient stone ruins, fantasy concept art, golden hour
+snow covered mountain temple in winter, frozen pond, bare trees, overcast sky, quiet atmosphere
+open grassland under a dramatic sunset sky with towering cumulus clouds, low horizon

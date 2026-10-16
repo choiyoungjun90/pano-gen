@@ -1,0 +1,4 @@
+# macOS Apple Silicon (MPS)
+-r common.txt
+torch>=2.4
+gguf>=0.10

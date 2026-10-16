@@ -1,0 +1,446 @@
+"""로컬 웹 UI — 프롬프트 입력 → 진행도 → 2K 확인(컨펌/수정) → 고른 시드만 8K.
+
+  panogen ui [--port 8370]      → http://127.0.0.1:8370/
+
+GPU 작업은 `python -m panogen generate|upscale` 하위 프로세스로 한 번에 하나만 돌리고,
+그 출력(로그 줄 + diffusers tqdm 진행 막대)을 읽어 진행도를 만든다. 작업이 끝나면 프로세스가
+종료되므로 모델 메모리가 매번 반환된다 (16GB 맥에서 서버가 메모리를 붙잡지 않도록).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+from panogen.config import Config
+
+TQDM = re.compile(r"(\d+)/(\d+) \[([\d:]+)<([\d:?]+)")
+IMG_IDX = re.compile(r"\((\d+)/(\d+)\)")
+TILE = re.compile(r"타일 (\d+)/(\d+)")
+BENCH = re.compile(r"===== bench: (\S+) =====")
+GEN_DONE = re.compile(r"\s*생성 \d+s\s*$")
+
+
+def slug(text: str, n: int = 24) -> str:
+    s = re.sub(r"[^\w\-]+", "_", text.strip().lower(), flags=re.UNICODE).strip("_")
+    return s[:n] or "pano"
+
+
+class Job:
+    """하위 프로세스 하나의 상태. 출력 줄을 읽으며 phase/step 을 갱신."""
+
+    def __init__(self, kind: str, cmd: list[str], name: str, root: Path):
+        self.kind, self.cmd, self.name = kind, cmd, name
+        self.state = "running"          # running | done | error | cancelled
+        self.phase = "starting"         # encoding | loading | generating | seam | postprocess | upscaling
+        self.image = [0, 0]             # 몇 번째 이미지 / 전체
+        self.step = [0, 0]              # 샘플링 step / 전체
+        self.eta = ""                   # tqdm 남은 시간
+        self.tile = [0, 0]
+        self.sub = ""                   # bench: 지금 돌고 있는 백엔드 폴더
+        self.in_seam = False
+        self.lines: list[str] = []
+        self.started = time.time()
+        self.ended: float | None = None
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONUTF8="1")
+        self.proc = subprocess.Popen(cmd, cwd=root, env=env, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, bufsize=0)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        buf = b""
+        while chunk := self.proc.stdout.read(256):
+            buf += chunk
+            *parts, buf = re.split(rb"[\r\n]", buf)
+            for p in parts:
+                if p.strip():
+                    self._line(p.decode("utf-8", "replace"))
+        if buf.strip():
+            self._line(buf.decode("utf-8", "replace"))
+        code = self.proc.wait()
+        if self.state == "running":
+            self.state = "done" if code == 0 else "error"
+        self.ended = time.time()
+
+    def _line(self, s: str):
+        is_bar = "|" in s and TQDM.search(s)
+        if not is_bar:
+            self.lines = (self.lines + [s.rstrip()])[-200:]
+        if (m := BENCH.search(s)):
+            self.sub, self.image, self.step = m[1], [0, 0], [0, 0]
+            self.phase = "starting"
+        elif "받는 중" in s:
+            self.phase = "downloading"
+        elif "[1/3]" in s:
+            self.phase = "encoding"
+        elif "[2/3]" in s:
+            self.phase = "loading"
+        elif "준비 완료" in s:   # 이음새 인페인팅 중 모델을 다시 올린 경우는 seam 유지
+            self.phase = "seam" if self.in_seam else "generating"
+        elif "[3/3]" in s or s.startswith("[upscale]"):
+            if (m := IMG_IDX.search(s)):
+                self.image = [int(m[1]), int(m[2])]
+            self.step, self.tile = [0, 0], [0, 0]
+            if s.startswith("[upscale]"):
+                self.phase = "upscaling"
+            elif self.phase == "postprocess":     # 두 번째 이미지부터는 모델이 이미 올라가 있음
+                self.phase = "generating"
+        elif GEN_DONE.match(s):
+            self.phase = "postprocess"
+        elif "이음새 인페인팅 (" in s:
+            self.phase, self.step, self.in_seam = "seam", [0, 0], True
+        elif "이음새 인페인팅 완료" in s:
+            self.phase, self.in_seam = "postprocess", False
+        elif s.lstrip().startswith("디테일 강화:"):
+            self.phase, self.tile = "refining", [0, 0]
+        elif s.startswith("[refine]"):
+            if (m := IMG_IDX.search(s)):
+                self.image = [int(m[1]), int(m[2])]
+            self.phase, self.tile = "refining", [0, 0]
+        elif "업스케일" in s and self.kind == "generate":
+            self.phase = "upscaling"
+        elif (m := TILE.search(s)):
+            self.tile = [int(m[1]), int(m[2])]
+        if is_bar and self.phase in ("generating", "seam"):
+            m = TQDM.search(s)
+            self.step, self.eta = [int(m[1]), int(m[2])], m[4]
+
+    def cancel(self):
+        if self.state == "running":
+            self.state = "cancelled"
+            self.proc.terminate()
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "name": self.name, "sub": self.sub, "state": self.state, "phase": self.phase,
+                "image": self.image, "step": self.step, "eta": self.eta, "tile": self.tile,
+                "elapsed": round((self.ended or time.time()) - self.started), "log": self.lines[-40:]}
+
+
+def list_results(out_root: Path, name: str) -> list[dict]:
+    d = out_root / name
+    items = []
+    inp = sorted(d.glob("input.*"))
+    inp_url = f"/outputs/{name}/{inp[0].name}" if inp else None
+    for f in sorted(d.glob("*_2k.png")):
+        stem = f.stem.removesuffix("_2k")
+        meta_p = d / f"{stem}.json"
+        meta = json.loads(meta_p.read_text(encoding="utf-8")) if meta_p.exists() else {}
+        big = sorted(d.glob(f"{stem}_*k.jpg")) + sorted(d.glob(f"{stem}_*px.jpg"))
+        items.append({"stem": stem, "seed": meta.get("seed"), "prompt": meta.get("prompt", ""),
+                      "backend": meta.get("backend", "dit360"), "fast": meta.get("fast", False),
+                      "refined": meta.get("refined", False),
+                      "seam": meta.get("seam_verdict"), "seconds": meta.get("generate_seconds"),
+                      "peak_gb": meta.get("peak_memory_gb"), "steps": meta.get("steps"),
+                      "img2k": f"/outputs/{name}/{f.name}", "input": inp_url, "input_meta": meta.get("input"),
+                      "img8k": f"/outputs/{name}/{big[0].name}" if big else None})
+    return items
+
+
+def list_sessions(out_root: Path) -> list[dict]:
+    out = []
+    for d in sorted((p for p in out_root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True):
+        metas = sorted(d.glob("*.json"))
+        if not metas:
+            continue
+        m = json.loads(metas[0].read_text(encoding="utf-8"))
+        prompt = m.get("prompt", "")
+        out.append({"name": d.name, "prompt": prompt, "count": len(list(d.glob("*_2k.png"))),
+                    "backend": m.get("backend", "dit360") + (" fast" if m.get("fast") else ""),
+                    "mtime": time.strftime("%m-%d %H:%M", time.localtime(d.stat().st_mtime))})
+    return out[:30]
+
+
+def _cached(repo: str, filename: str) -> bool:
+    from huggingface_hub import try_to_load_from_cache
+
+    r = try_to_load_from_cache(repo, filename)
+    return isinstance(r, str) and Path(r).exists()
+
+
+def _weights_cached(repo: str, sub: str) -> bool:
+    """sub 폴더의 가중치(단일 파일 또는 샤드 전부)가 캐시에 있는지 — 네트워크 없이 확인."""
+    from huggingface_hub import try_to_load_from_cache
+
+    for idx_name in ("model.safetensors.index.json", "diffusion_pytorch_model.safetensors.index.json"):
+        idx = try_to_load_from_cache(repo, f"{sub}/{idx_name}")
+        if isinstance(idx, str) and Path(idx).exists():
+            shards = set(json.loads(Path(idx).read_text(encoding="utf-8"))["weight_map"].values())
+            return all(_cached(repo, f"{sub}/{f}") for f in shards)
+    return any(_cached(repo, f"{sub}/{f}") for f in ("model.safetensors", "diffusion_pytorch_model.safetensors"))
+
+
+def _repo_cached(repo: str) -> bool:
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot_download(repo, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
+def model_status(root: Path, name: str, b: dict, gguf: bool) -> dict:
+    """백엔드별 준비 상태 (받은 것 / 없는 것). 다운로드 버튼과 생성 가능 여부 표시에 씀."""
+    base = b.get("base", "")
+    missing = []
+    subs = ["text_encoder", "vae"] + (["text_encoder_2"] if b.get("kind") == "dit360" else [])
+    for sub in subs:
+        if not _weights_cached(base, sub):
+            missing.append(f"{sub}")
+    if gguf:
+        if not (b.get("gguf_repo") and _cached(b["gguf_repo"], b["gguf_file"])):
+            missing.append(f"transformer (GGUF {b.get('gguf_file', '')})")
+    elif not _weights_cached(base, "transformer"):
+        missing.append("transformer")
+    if b.get("lora"):
+        ok = _cached(b["lora"], b["lora_file"]) if b.get("lora_file") else _repo_cached(b["lora"])
+        if not ok:
+            missing.append("파노라마 LoRA")
+    if b.get("kind") == "dit360" and not (root / "third_party" / "DiT360" / "src" / "pipeline.py").exists():
+        missing.append("DiT360 코드 (scripts/fetch_dit360.py)")
+    fast = bool(b.get("speed_lora"))
+    fast_ready = fast and _cached(b["speed_lora"], b["speed_lora_file"])
+    return {"name": name, "base": base, "kind": b.get("kind"), "ready": not missing, "missing": missing,
+            "fast": fast, "fast_ready": fast_ready, "refine": b.get("kind") in ("dit360", "qwen"),
+            "gated": base.startswith("black-forest-labs/")}
+
+
+def bench_summary(out_root: Path, tag: str) -> dict | None:
+    p = out_root / f"bench_{tag}.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+
+
+def list_benches(out_root: Path) -> list[dict]:
+    out = []
+    for p in sorted(out_root.glob("bench_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        s = json.loads(p.read_text(encoding="utf-8"))
+        out.append({"tag": s["tag"], "created": s.get("created", ""), "prompts": len(s.get("prompts", [])),
+                    "seeds": s.get("seeds", []),
+                    "runs": [{"label": r["backend"] + (" fast" if r.get("fast") else ""), "status": r["status"]}
+                             for r in s.get("runs", [])]})
+    return out[:20]
+
+
+def compare(out_root: Path, tag: str) -> dict | None:
+    """비교 표: 행 = 프롬프트×시드, 열 = 백엔드 실행. 칸 = 2K 이미지와 시간·메모리·이음새."""
+    s = bench_summary(out_root, tag)
+    if not s:
+        return None
+    pidx = {p: i for i, p in enumerate(s["prompts"])}
+    for r in s["runs"]:
+        r["label"] = r["backend"] + (" fast" if r.get("fast") else "")
+        cells = {}
+        if (out_root / r["dir"]).is_dir():
+            for it in list_results(out_root, r["dir"]):
+                if it["prompt"] in pidx:
+                    cells[f"{pidx[it['prompt']]}_{it['seed']}"] = it
+        r["cells"] = cells
+    return s
+
+
+def serve(cfg: Config, port: int = 8370, extra_config: Path | None = None) -> None:
+    root = cfg.root
+    out_root = cfg.get_path(cfg["output"]["dir"])
+    out_root.mkdir(parents=True, exist_ok=True)
+    page = root / "ui" / "index.html"
+    base_cmd = [sys.executable, "-m", "panogen"] + (["--config", str(extra_config)] if extra_config else [])
+    state: dict = {"job": None}
+    backends = cfg.get("backends", {})
+    lock = threading.Lock()
+    try:   # 맥(mps-16g)은 트랜스포머를 GGUF 로 받으므로 준비 상태 확인 기준이 다름
+        from panogen.device import detect
+        from panogen.profiles import resolve
+
+        d = detect()
+        gguf = resolve(cfg["generate"]["profile"], d["device"], d["vram_gb"]).transformer == "gguf"
+    except Exception:
+        gguf = False
+
+    def start(kind: str, args: list[str], name: str) -> Job:
+        with lock:
+            j = state["job"]
+            if j and j.state == "running":
+                raise RuntimeError("이미 작업이 진행 중입니다.")
+            state["job"] = Job(kind, base_cmd + [kind] + args, name, root)
+            return state["job"]
+
+    class Handler(SimpleHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _json(self, obj, code=200):
+            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _file(self, path: Path, ctype: str):
+            data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _upload(self, n: int):
+            import io
+
+            from PIL import Image
+
+            if n <= 0 or n > 40 * 1024**2:
+                return self._json({"error": "이미지는 40MB 이하만 첨부할 수 있습니다."}, 400)
+            data = self.rfile.read(n)
+            try:
+                im = Image.open(io.BytesIO(data))
+                im.verify()
+                im = Image.open(io.BytesIO(data))
+            except Exception:
+                return self._json({"error": "이미지 파일이 아닙니다."}, 400)
+            ext = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}.get(im.format)
+            if not ext:
+                return self._json({"error": f"지원하지 않는 형식: {im.format} (JPG·PNG·WEBP)"}, 400)
+            up = out_root / "_uploads"
+            up.mkdir(exist_ok=True)
+            fid = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}{ext}"
+            (up / fid).write_bytes(data)
+            from panogen.imagein import is_panorama
+
+            return self._json({"id": fid, "url": f"/outputs/_uploads/{fid}", "width": im.width,
+                               "height": im.height, "panorama": is_panorama(im.width, im.height)})
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            if u.path in ("/", "/index.html"):
+                return self._file(page, "text/html; charset=utf-8")
+            if u.path == "/api/job":
+                j = state["job"]
+                return self._json(j.to_dict() if j else None)
+            if u.path == "/api/backends":
+                default = cfg.get("model", {}).get("backend", "dit360")
+                return self._json([{"name": k, "default": k == default, "fast": bool(v.get("speed_lora")),
+                                    "refine": v.get("kind") in ("dit360", "qwen"), "base": v.get("base", "")}
+                                   for k, v in backends.items()])
+            if u.path == "/api/models":
+                import shutil
+
+                hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+                hub.mkdir(parents=True, exist_ok=True)
+                free = shutil.disk_usage(hub).free / 1024**3
+                return self._json({"disk_free_gb": round(free, 1), "gguf": gguf,
+                                   "default": cfg.get("model", {}).get("backend", "dit360"),
+                                   "models": [model_status(root, k, v, gguf) for k, v in backends.items()]})
+            if u.path == "/api/benches":
+                return self._json(list_benches(out_root))
+            if u.path == "/api/compare":
+                tag = (q.get("tag") or [""])[0]
+                c = compare(out_root, tag) if re.fullmatch(r"[\w\-]+", tag or "") else None
+                return self._json(c) if c else self._json({"error": "없는 비교"}, 404)
+            if u.path == "/api/sessions":
+                return self._json(list_sessions(out_root))
+            if u.path == "/api/results":
+                name = (q.get("name") or [""])[0]
+                if not name or "/" in name or ".." in name or not (out_root / name).is_dir():
+                    return self._json({"error": "없는 폴더"}, 404)
+                return self._json(list_results(out_root, name))
+            if u.path.startswith("/outputs/"):
+                f = (out_root / unquote(u.path[len("/outputs/"):])).resolve()
+                if out_root.resolve() not in f.parents or not f.is_file():
+                    return self.send_error(HTTPStatus.NOT_FOUND)
+                ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                         ".webp": "image/webp"}.get(f.suffix.lower(), "application/json")
+                return self._file(f, ctype)
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            n = int(self.headers.get("Content-Length") or 0)
+            if u.path == "/api/upload":   # 첨부 이미지 (본문 = 이미지 바이트)
+                return self._upload(n)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            try:
+                if u.path == "/api/generate":
+                    prompt = str(body.get("prompt", "")).strip()
+                    if not prompt:
+                        raise ValueError("프롬프트를 입력하세요.")
+                    name = f"{time.strftime('%Y%m%d_%H%M%S')}_{slug(prompt)}"
+                    args = ["-p", prompt, "-n", name, "-c", str(max(1, min(8, int(body.get("count") or 1)))),
+                            "--no-upscale"]
+                    if body.get("backend"):
+                        if body["backend"] not in backends:
+                            raise ValueError(f"알 수 없는 모델: {body['backend']}")
+                        args += ["--backend", body["backend"]]
+                    if body.get("fast"):
+                        args.append("--fast")
+                    if body.get("seed") not in (None, ""):
+                        args += ["--seed", str(int(body["seed"]))]
+                    if body.get("steps") not in (None, ""):
+                        args += ["--steps", str(max(1, min(60, int(body["steps"]))))]
+                    if body.get("image"):
+                        fid = str(body["image"])
+                        img = out_root / "_uploads" / fid
+                        if not re.fullmatch(r"[\w\-]+\.(jpg|png|webp)", fid) or not img.is_file():
+                            raise ValueError("첨부 이미지를 다시 올려 주세요.")
+                        args += ["--image", str(img)]
+                        if body.get("strength") not in (None, ""):
+                            args += ["--strength", str(max(0.0, min(1.0, float(body["strength"]))))]
+                        if body.get("fov") not in (None, ""):
+                            args += ["--fov", str(max(30.0, min(170.0, float(body["fov"]))))]
+                    return self._json(start("generate", args, name).to_dict())
+                if u.path == "/api/upscale":
+                    name = str(body.get("name", ""))
+                    seeds = [str(int(s)) for s in body.get("seeds", [])]
+                    if not seeds or "/" in name or ".." in name or not (out_root / name).is_dir():
+                        raise ValueError("8K 로 만들 시드를 고르세요.")
+                    args = [str(out_root / name), "--seed", *seeds] + (["--refine"] if body.get("refine") else [])
+                    return self._json(start("upscale", args, name).to_dict())
+                if u.path == "/api/download":
+                    be = str(body.get("backend", ""))
+                    if be not in backends:
+                        raise ValueError(f"알 수 없는 모델: {be}")
+                    return self._json(start("download", ["--backend", be] + (["--fast"] if body.get("fast") else []),
+                                            be).to_dict())
+                if u.path == "/api/bench":
+                    runs = []
+                    for r in body.get("runs", []):
+                        if r.get("backend") not in backends:
+                            raise ValueError(f"알 수 없는 모델: {r.get('backend')}")
+                        runs.append(r["backend"] + (":fast" if r.get("fast") else ""))
+                    seeds = [str(int(x)) for x in body.get("seeds", [])] or ["1"]
+                    if not runs:
+                        raise ValueError("비교할 모델을 하나 이상 고르세요.")
+                    tag = time.strftime("%Y%m%d_%H%M%S")
+                    args = ["--backends", ",".join(runs), "--seeds", *seeds, "--tag", tag]
+                    if body.get("limit"):
+                        args += ["--limit", str(max(1, int(body["limit"])))]
+                    return self._json(start("bench", args, tag).to_dict())
+                if u.path == "/api/cancel":
+                    if state["job"]:
+                        state["job"].cancel()
+                    return self._json({"ok": True})
+            except (RuntimeError, ValueError) as e:
+                return self._json({"error": str(e)}, 400)
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"panogen UI → http://127.0.0.1:{port}/   (Ctrl+C 로 종료)", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if state["job"]:
+            state["job"].cancel()
+        httpd.server_close()

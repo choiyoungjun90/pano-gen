@@ -1,0 +1,19 @@
+# config/local.toml 로 복사해서 머신별 값만 적으세요 (git 제외).
+
+# --- Windows + RTX 4090 (24GB) 예시 ---
+# [generate]
+# profile = "cuda-24g"
+# [upscale]
+# tile = 768
+
+# --- Mac M4 16GB 예시 (실험적) ---
+# [generate]
+# profile = "mps-16g"
+# [backends.dit360]
+# steps = 20
+# [upscale]
+# tile = 384
+
+# --- 기본 백엔드 바꾸기 ---
+# [model]
+# backend = "qwen360"
